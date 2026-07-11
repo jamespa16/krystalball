@@ -1,0 +1,10 @@
+[project]
+name = "krystalball"
+version = "0.1.0"
+description = "Live webcam next-frame prediction, trained online in real time."
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=2.2.6",
+    "opencv-python>=5.0.0.93",
+    "torch>=2.13.0",
+]

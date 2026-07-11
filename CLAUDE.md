@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project status
 
-This repository is currently empty of code — it contains only `idea.md` (the project spec, untracked in git) and `LICENSE` (Apache 2.0). There is no build system, package manifest, or source tree yet. When asked to start implementing, treat `idea.md` as the authoritative spec and check it back into git along with the code.
+v1 is implemented: `main.py` (entrypoint/training loop), `model.py`, `webcam.py`, `config.py`, and `requirements.txt`. Treat `idea.md` as the authoritative spec for any future changes.
 
 ## What this project is
 
@@ -25,9 +25,25 @@ Key behavioral requirements from the spec (do not silently drop these when imple
 ## Stack
 
 - Python, PyTorch (model/training), OpenCV `cv2` (webcam capture + display window).
-- Expect a `requirements.txt` (torch, opencv-python, numpy) once the deliverable is created.
+- Dependencies (torch, opencv-python, numpy) are managed by `uv` via `pyproject.toml`/`uv.lock`.
 - Config values (camera index, working resolution, display upscale factor, learning rate, hidden channel count, optimizer) should be exposed as easily editable constants or CLI flags, not buried in logic.
 
 ## Commands
 
-No build/lint/test tooling exists yet. Once a `requirements.txt` and script(s) are added, update this section with actual install/run commands (e.g. `pip install -r requirements.txt`, `python <entrypoint>.py`) — do not invent commands that don't correspond to real files.
+This is a `uv` project (`pyproject.toml` + `uv.lock`).
+
+```
+uv sync                        # install/sync dependencies into .venv
+uv run main.py                 # run with defaults (camera 0, 96x72, upscale 6x)
+uv run main.py --help          # see all CLI flags (camera index, resolution, lr, etc.)
+uv add <package>                # add a new dependency (updates pyproject.toml + uv.lock)
+```
+
+No lint/test tooling exists yet.
+
+## Code layout
+
+- `config.py` — argparse CLI flags / defaults (camera index, resolution, lr, hidden channels, optimizer, loss).
+- `model.py` — `Encoder` / `ConvLSTMCell` / `Decoder` / `NextFramePredictor`, plus `detach_hidden()` and the `get_loss_fn()` swappable-loss factory.
+- `webcam.py` — `WebcamStream`: background-thread capture with a lock-protected latest-frame buffer.
+- `main.py` — entrypoint; owns the predict-then-learn training loop, display compositing/overlay, and `q`/`r` key handling.
