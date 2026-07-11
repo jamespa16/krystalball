@@ -76,6 +76,60 @@ class UpBlock(nn.Module):
         return x
 
 
+class FlowHead(nn.Module):
+    """Predicts a dense 2-channel (dx, dy) flow field from a (prev, curr)
+    frame pair. Small conv encoder-decoder reusing DownBlock/UpBlock for
+    consistency with the main Encoder/Decoder. The final conv is
+    zero-initialized so a fresh model predicts exactly zero flow (identity
+    warp), mirroring the zero-init trick on Decoder.final_up."""
+
+    def __init__(self, in_channels: int = 6, hidden_channels: int = 16):
+        super().__init__()
+        self.in_conv = nn.Conv2d(in_channels, hidden_channels, 3, padding=1)
+        self.down = DownBlock(hidden_channels, hidden_channels * 2, num_res_blocks=1)
+        self.up = UpBlock(hidden_channels * 2, hidden_channels, hidden_channels, num_res_blocks=1)
+        self.out_conv = nn.Conv2d(hidden_channels, 2, 3, padding=1)
+        nn.init.zeros_(self.out_conv.weight)
+        nn.init.zeros_(self.out_conv.bias)
+
+    def forward(self, prev_frame, curr_frame):
+        x = self.in_conv(torch.cat([prev_frame, curr_frame], dim=1))
+        skip = x
+        x = self.down(x)
+        x = self.up(x, skip)
+        return self.out_conv(x)
+
+
+def warp_frame(frame: torch.Tensor, flow: torch.Tensor) -> torch.Tensor:
+    """Backward-warp `frame` by `flow` (pixel-unit displacement): for each
+    output pixel p, sample frame at (p - flow(p)). Used to extrapolate the
+    current frame one step forward under a constant-velocity assumption."""
+    b, c, h, w = frame.shape
+    ys, xs = torch.meshgrid(
+        torch.arange(h, device=frame.device, dtype=frame.dtype),
+        torch.arange(w, device=frame.device, dtype=frame.dtype),
+        indexing="ij",
+    )
+    base_grid = torch.stack([xs, ys], dim=-1).unsqueeze(0)  # (1, H, W, 2), (x, y) order
+    sample_px = base_grid - flow.permute(0, 2, 3, 1)  # (B, H, W, 2)
+    norm_x = 2.0 * sample_px[..., 0] / max(w - 1, 1) - 1.0
+    norm_y = 2.0 * sample_px[..., 1] / max(h - 1, 1) - 1.0
+    grid = torch.stack([norm_x, norm_y], dim=-1)
+    return F.grid_sample(frame, grid, mode="bilinear", padding_mode="border", align_corners=True)
+
+
+def _resize_flow(flow: torch.Tensor, size: tuple) -> torch.Tensor:
+    """Downsample a pixel-unit flow field to `size` (h, w), rescaling
+    displacement magnitudes to match the new pixel grid (flow values are in
+    pixel units of the resolution they were computed at, so halving spatial
+    size must also halve the dx/dy magnitudes)."""
+    _, _, h, w = flow.shape
+    new_h, new_w = size
+    resized = F.interpolate(flow, size=size, mode="bilinear", align_corners=True)
+    scale = torch.tensor([new_w / w, new_h / h], device=flow.device, dtype=flow.dtype).view(1, 2, 1, 1)
+    return resized * scale
+
+
 class ConvLSTMCell(nn.Module):
     """A single ConvLSTM step: same recurrence as a normal LSTM, but every
     gate is a convolution instead of a matmul, so spatial structure survives."""
@@ -171,9 +225,11 @@ class Decoder(nn.Module):
 
     def __init__(self, in_channels: int, skip_channels: list, base_channels: int = 32,
                  out_channels: int = 3, delta_scale: float = 0.6,
-                 res_blocks_per_scale: int = 1):
+                 res_blocks_per_scale: int = 1, use_blend_mask: bool = False):
         super().__init__()
         self.delta_scale = delta_scale
+        self.use_blend_mask = use_blend_mask
+        self.out_channels = out_channels
         num_scales = len(skip_channels) + 1
         up_channels = [base_channels * (2 ** i) for i in range(num_scales)][::-1]
         skip_rev = list(reversed(skip_channels))
@@ -184,52 +240,116 @@ class Decoder(nn.Module):
             blocks.append(UpBlock(prev_channels, skip_rev[i], out_c, res_blocks_per_scale))
             prev_channels = out_c
         self.up_blocks = nn.ModuleList(blocks)
-        self.final_up = nn.ConvTranspose2d(prev_channels, out_channels, 4, stride=2, padding=1)
+        # With blend masking, final_up outputs delta (out_channels) + a
+        # fully-generated pixel estimate (out_channels) + a 1-channel blend
+        # mask, instead of just delta -- see forward().
+        final_out = out_channels * 2 + 1 if use_blend_mask else out_channels
+        self.final_up = nn.ConvTranspose2d(prev_channels, final_out, 4, stride=2, padding=1)
+        # Zero-init the layer that produces the residual delta: at
+        # construction, delta = delta_scale * tanh(0) = 0, so a fresh
+        # model's first prediction is exactly the input frame rather than a
+        # random-magnitude delta from default init.
+        nn.init.zeros_(self.final_up.weight)
+        nn.init.zeros_(self.final_up.bias)
+        if use_blend_mask:
+            # Learnable scalar gate on the mask, zero-initialized: at
+            # construction mask = sigmoid(0) * 0 = 0 exactly, so prediction
+            # is exactly base_frame + delta (delta is also 0 from the
+            # zero-init above) -- the same exact-identity-at-init guarantee
+            # as the rest of this decoder, not just an approximation. Once
+            # training produces gradient favoring the generation pathway,
+            # this gate moves off zero and the mask starts contributing.
+            self.mask_gate = nn.Parameter(torch.zeros(1))
 
     def forward(self, hidden_state, skips, base_frame):
         x = hidden_state
         for block, skip in zip(self.up_blocks, reversed(skips)):
             x = block(x, skip)
-        delta = self.delta_scale * torch.tanh(self.final_up(x))
-        return base_frame + delta
+        raw = self.final_up(x)
+        if self.use_blend_mask:
+            oc = self.out_channels
+            delta = self.delta_scale * torch.tanh(raw[:, :oc])
+            gen = torch.sigmoid(raw[:, oc:2 * oc])
+            # Clamp the gate to [0, 1] so mask stays a valid convex-blend
+            # weight no matter how far gradient descent pushes the raw
+            # parameter -- otherwise mask could exceed 1 and make (1 - mask)
+            # negative, amplifying rather than blending the warped path.
+            gate = torch.clamp(self.mask_gate, 0.0, 1.0)
+            mask = torch.sigmoid(raw[:, 2 * oc:2 * oc + 1]) * gate
+            return (mask * gen + (1 - mask) * (base_frame + delta)).clamp(0.0, 1.0)
+        delta = self.delta_scale * torch.tanh(raw)
+        return (base_frame + delta).clamp(0.0, 1.0)
 
 
 class NextFramePredictor(nn.Module):
-    """encoder -> stacked ConvLSTM -> decoder. Carries recurrent state
-    across calls so predictions are conditioned on motion history, not a
-    single frame. `hidden` is None or list[(h, c)], one tuple per ConvLSTM
-    layer."""
+    """(flow-warp) -> encoder -> stacked ConvLSTM -> decoder. Carries
+    recurrent state across calls so predictions are conditioned on motion
+    history, not a single frame. `hidden` is None or (lstm_hidden,
+    prev_frame): lstm_hidden is list[(h, c)] (one tuple per ConvLSTM
+    layer), prev_frame is the raw input tensor from the previous call, used
+    to compute optical flow to the current frame."""
 
     def __init__(self, in_channels: int = 3, encoder_base_channels: int = 32,
                  encoder_scales: int = 3, res_blocks_per_scale: int = 1,
                  lstm_hidden_channels: int = 128, lstm_layers: int = 2,
-                 kernel_size: int = 3, delta_scale: float = 0.6):
+                 kernel_size: int = 3, delta_scale: float = 0.6,
+                 use_flow: bool = True, flow_hidden_channels: int = 16,
+                 use_blend_mask: bool = True):
         super().__init__()
+        self.use_flow = use_flow
+        if use_flow:
+            self.flow_head = FlowHead(in_channels * 2, flow_hidden_channels)
+        encoder_in_channels = in_channels + 2 if use_flow else in_channels
         self.encoder = Encoder(
-            in_channels, encoder_base_channels, encoder_scales, res_blocks_per_scale
+            encoder_in_channels, encoder_base_channels, encoder_scales, res_blocks_per_scale
         )
         self.lstm = ConvLSTMStack(
             self.encoder.out_channels, [lstm_hidden_channels] * lstm_layers, kernel_size
         )
         self.decoder = Decoder(
             self.lstm.out_channels, self.encoder.skip_channels, encoder_base_channels,
-            in_channels, delta_scale, res_blocks_per_scale
+            in_channels, delta_scale, res_blocks_per_scale, use_blend_mask
         )
 
     def forward(self, x, hidden):
-        features, skips = self.encoder(x)
-        top_h, hidden = self.lstm(features, hidden)
-        pred = self.decoder(top_h, skips, x)
-        return pred, hidden
+        lstm_hidden, prev_frame = hidden if hidden is not None else (None, None)
+        if self.use_flow:
+            if prev_frame is not None:
+                flow = self.flow_head(prev_frame, x)
+                warped = warp_frame(x, flow)
+            else:
+                flow = torch.zeros(x.shape[0], 2, x.shape[2], x.shape[3], device=x.device, dtype=x.dtype)
+                warped = x
+            encoder_in = torch.cat([x, flow], dim=1)
+        else:
+            warped, encoder_in = x, x
+        features, skips = self.encoder(encoder_in)
+        if self.use_flow and prev_frame is not None:
+            # Skip features were captured from the current (unwarped) frame,
+            # but base_frame is now motion-extrapolated -- warp the skips by
+            # the same flow (rescaled per-scale) so the detail they add is
+            # spatially consistent with the predicted-frame geometry instead
+            # of ghosting at moving edges.
+            skips = [warp_frame(skip, _resize_flow(flow, skip.shape[2:])) for skip in skips]
+        top_h, lstm_hidden = self.lstm(features, lstm_hidden)
+        pred = self.decoder(top_h, skips, warped)
+        return pred, (lstm_hidden, x)
 
 
 def detach_hidden(hidden):
-    """Cut every layer's (h, c) state loose from the autograd graph so the
+    """Cut every tensor in `hidden` loose from the autograd graph so the
     next timestep's backward pass can't walk back through prior timesteps.
-    `hidden` is None or list[(h, c)], one tuple per ConvLSTM layer."""
+    Recurses through the opaque (nested tuple/list of tensors) hidden-state
+    structure -- callers never need to know its shape."""
     if hidden is None:
         return None
-    return [(h.detach(), c.detach()) for h, c in hidden]
+    if isinstance(hidden, torch.Tensor):
+        return hidden.detach()
+    if isinstance(hidden, tuple):
+        return tuple(detach_hidden(h) for h in hidden)
+    if isinstance(hidden, list):
+        return [detach_hidden(h) for h in hidden]
+    raise TypeError(f"Unexpected hidden-state element: {type(hidden)!r}")
 
 
 def _gaussian_window(window_size: int, sigma: float, channels: int) -> torch.Tensor:
@@ -238,6 +358,30 @@ def _gaussian_window(window_size: int, sigma: float, channels: int) -> torch.Ten
     g = (g / g.sum()).unsqueeze(0)
     window_2d = g.t() @ g
     return window_2d.expand(channels, 1, window_size, window_size).contiguous()
+
+
+def motion_weight_map(frame_t: torch.Tensor, frame_prev: torch.Tensor,
+                       motion_loss_weight: float) -> torch.Tensor:
+    """Per-pixel loss weight, higher where the frame actually changed, so
+    gradient concentrates on real motion instead of being diluted by the
+    (already trivially correct) static background. Mean-normalized so the
+    weight map's own mean is always exactly 1 + motion_loss_weight,
+    regardless of how much motion is actually in a given frame -- keeps
+    overall loss magnitude stable frame-to-frame."""
+    diff = (frame_t - frame_prev).abs().mean(dim=1, keepdim=True)
+    denom = diff.mean(dim=(1, 2, 3), keepdim=True).clamp_min(1e-4)
+    return 1.0 + motion_loss_weight * (diff / denom)
+
+
+class WeightedMSELoss(nn.Module):
+    """MSE with an optional per-pixel weight map; identical to plain MSE
+    when weight_map is None."""
+
+    def forward(self, pred, target, weight_map=None):
+        sq = (pred - target) ** 2
+        if weight_map is not None:
+            sq = sq * weight_map
+        return sq.mean()
 
 
 class SSIMLoss(nn.Module):
@@ -253,7 +397,7 @@ class SSIMLoss(nn.Module):
         self.data_range = data_range
         self.register_buffer("window", _gaussian_window(window_size, sigma, channels))
 
-    def forward(self, pred, target):
+    def forward(self, pred, target, weight_map=None):
         window = self.window.to(device=pred.device, dtype=pred.dtype)
         pad = self.window_size // 2
         c1 = (0.01 * self.data_range) ** 2
@@ -271,7 +415,10 @@ class SSIMLoss(nn.Module):
         ssim_map = ((2 * mu_pt + c1) * (2 * sig_pt + c2)) / (
             (mu_p2 + mu_t2 + c1) * (sig_p2 + sig_t2 + c2)
         )
-        return 1.0 - ssim_map.mean()
+        loss_map = 1.0 - ssim_map
+        if weight_map is not None:
+            loss_map = loss_map * weight_map
+        return loss_map.mean()
 
 
 class BlendedLoss(nn.Module):
@@ -280,20 +427,20 @@ class BlendedLoss(nn.Module):
     def __init__(self, ssim_weight: float = 0.5, channels: int = 3):
         super().__init__()
         self.ssim_weight = ssim_weight
-        self.mse = nn.MSELoss()
+        self.mse = WeightedMSELoss()
         self.ssim = SSIMLoss(channels=channels)
 
-    def forward(self, pred, target):
-        return (1 - self.ssim_weight) * self.mse(pred, target) + self.ssim_weight * self.ssim(
-            pred, target
-        )
+    def forward(self, pred, target, weight_map=None):
+        return (1 - self.ssim_weight) * self.mse(
+            pred, target, weight_map=weight_map
+        ) + self.ssim_weight * self.ssim(pred, target, weight_map=weight_map)
 
 
 def get_loss_fn(name: str, ssim_weight: float = 0.5, channels: int = 3):
     """Factory so the loss is swappable without touching the training loop."""
     name = name.lower()
     if name == "mse":
-        return nn.MSELoss()
+        return WeightedMSELoss()
     if name == "ssim":
         return SSIMLoss(channels=channels)
     if name == "mse_ssim":

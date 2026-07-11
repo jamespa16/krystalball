@@ -31,7 +31,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Factor to upscale each pane by for display only (default: 6)",
     )
     p.add_argument(
-        "--lr", type=float, default=1e-3, help="Optimizer learning rate (default: 1e-3)"
+        "--lr", type=float, default=2e-4, help="Optimizer learning rate (default: 2e-4)"
+    )
+    p.add_argument(
+        "--lr-warmup-steps",
+        type=int,
+        default=200,
+        help="Number of training steps (optimizer.step() calls) to linearly ramp the "
+        "LR up from --lr-warmup-start-factor*--lr to the full --lr value; re-triggered "
+        "on every 'r' reset (default: 200; set 0 to disable warmup)",
+    )
+    p.add_argument(
+        "--lr-warmup-start-factor",
+        type=float,
+        default=0.05,
+        help="LR at the start of warmup, as a fraction of --lr (default: 0.05)",
     )
     p.add_argument(
         "--encoder-base-channels",
@@ -79,6 +93,32 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "at the cost of reacting more slowly to fast real motion.",
     )
     p.add_argument(
+        "--use-flow",
+        choices=["on", "off"],
+        default="on",
+        help="Predict a learned optical-flow field between consecutive frames and warp "
+        "the current frame forward by it to form the decoder's residual base (instead "
+        "of the raw current frame), plus feed the flow field as extra encoder input "
+        "channels (default: on)",
+    )
+    p.add_argument(
+        "--flow-hidden-channels",
+        type=int,
+        default=16,
+        help="Hidden channel count of the flow-prediction submodule (default: 16). "
+        "Lower this if --use-flow on measurably hurts CPU framerate.",
+    )
+    p.add_argument(
+        "--blend-mask",
+        choices=["on", "off"],
+        default="on",
+        help="Let the decoder additionally predict a fully-generated pixel estimate and "
+        "a per-pixel blend mask, so it can locally fall back away from the warped base "
+        "frame (e.g. in occlusion/disocclusion regions warping can't represent) instead "
+        "of being limited to a small bounded delta on top of it (default: on). Set to "
+        "off if this introduces training instability.",
+    )
+    p.add_argument(
         "--optimizer",
         choices=["adam", "sgd"],
         default="adam",
@@ -99,11 +139,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "Ignored for other --loss choices (default: 0.5)",
     )
     p.add_argument(
-        "--grad-clip-norm",
+        "--motion-loss-weight",
         type=float,
         default=1.0,
+        help="Extra per-pixel loss weight in regions that changed from the previous "
+        "training frame, on top of a base weight of 1 (default: 1.0, giving moving "
+        "regions ~2x the static background's average gradient weight). Set to 0 to "
+        "disable (uniform per-pixel weighting, today's behavior).",
+    )
+    p.add_argument(
+        "--grad-clip-norm",
+        type=float,
+        default=0.5,
         help="Max L2 norm for gradient clipping, applied after backward() and "
-        "before optimizer.step(); set to 0 to disable (default: 1.0)",
+        "before optimizer.step(); set to 0 to disable (default: 0.5)",
     )
     p.add_argument(
         "--device",

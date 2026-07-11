@@ -46,7 +46,7 @@ import numpy as np
 import torch
 
 from config import build_arg_parser
-from model import NextFramePredictor, detach_hidden, get_loss_fn
+from model import NextFramePredictor, detach_hidden, get_loss_fn, motion_weight_map
 from webcam import WebcamStream
 
 
@@ -71,6 +71,22 @@ def make_optimizer(name, params, lr):
     if name == "sgd":
         return torch.optim.SGD(params, lr=lr)
     raise ValueError(f"Unknown optimizer: {name!r}")
+
+
+def make_optimizer_and_scheduler(name, params, lr, warmup_steps, warmup_start_factor):
+    optimizer = make_optimizer(name, params, lr)
+    scheduler = None
+    if warmup_steps > 0:
+        # Ramps optimizer's lr from warmup_start_factor*lr up to lr over the
+        # first `warmup_steps` calls to scheduler.step(), then holds at lr.
+        # Rebuilding this (at startup and on every 'r' reset) restarts the
+        # ramp from step 0, which matters because the hidden state is most
+        # vulnerable to fast-moving weights right when it's freshest.
+        scheduler = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=warmup_start_factor, end_factor=1.0,
+            total_iters=warmup_steps,
+        )
+    return optimizer, scheduler
 
 
 def main():
@@ -102,8 +118,14 @@ def main():
         lstm_hidden_channels=args.lstm_hidden_channels,
         lstm_layers=args.lstm_layers,
         delta_scale=args.delta_scale,
+        use_flow=args.use_flow == "on",
+        flow_hidden_channels=args.flow_hidden_channels,
+        use_blend_mask=args.blend_mask == "on",
     ).to(device)
-    optimizer = make_optimizer(args.optimizer, model.parameters(), args.lr)
+    optimizer, lr_scheduler = make_optimizer_and_scheduler(
+        args.optimizer, model.parameters(), args.lr,
+        args.lr_warmup_steps, args.lr_warmup_start_factor,
+    )
     loss_fn = get_loss_fn(args.loss, ssim_weight=args.ssim_weight)
 
     webcam = WebcamStream(args.camera_index)
@@ -128,6 +150,7 @@ def main():
     # (buffered) frames, never the model's own predictions.
     train_hidden = None
     train_pred = None  # prediction awaiting the next buffered ground-truth frame
+    prev_train_frame = None  # previous training-consumed frame, for motion-weighted loss
     # `display_hidden`/`display_pred` drive the on-screen preview only when
     # buffering is active (delay > 0 frames); periodically reseeded with a
     # real frame and self-fed in between. Purely cosmetic -- no gradient
@@ -166,17 +189,25 @@ def main():
             if interval_frames == 1:
                 # --- predict-then-learn, one step behind (no buffering) ---
                 if train_pred is not None:
-                    loss = loss_fn(train_pred, real_tensor)
+                    weight_map = None
+                    if args.motion_loss_weight > 0:
+                        weight_map = motion_weight_map(
+                            real_tensor, prev_train_frame, args.motion_loss_weight
+                        )
+                    loss = loss_fn(train_pred, real_tensor, weight_map=weight_map)
                     optimizer.zero_grad(set_to_none=True)
                     loss.backward()
                     if args.grad_clip_norm > 0:
                         torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm)
                     optimizer.step()
+                    if lr_scheduler is not None:
+                        lr_scheduler.step()
                     loss_history.append(loss.item())
                     # Cut the graph so next timestep's backward can't walk
                     # back through this one -- backprop spans exactly one step.
                     train_hidden = detach_hidden(train_hidden)
                 train_pred, train_hidden = model(real_tensor, train_hidden)
+                prev_train_frame = real_tensor
                 pred_for_display = train_pred
                 is_anchor_step = True
             else:
@@ -192,18 +223,26 @@ def main():
                 while len(buffer) > target_lag:
                     ground_truth = buffer.popleft()
                     if train_pred is not None:
-                        loss = loss_fn(train_pred, ground_truth)
+                        weight_map = None
+                        if args.motion_loss_weight > 0:
+                            weight_map = motion_weight_map(
+                                ground_truth, prev_train_frame, args.motion_loss_weight
+                            )
+                        loss = loss_fn(train_pred, ground_truth, weight_map=weight_map)
                         optimizer.zero_grad(set_to_none=True)
                         loss.backward()
                         if args.grad_clip_norm > 0:
                             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm)
                         optimizer.step()
+                        if lr_scheduler is not None:
+                            lr_scheduler.step()
                         loss_history.append(loss.item())
                         # Same one-timestep-only invariant as above, just
                         # applied to a delayed (buffered) ground truth frame
                         # instead of the live one.
                         train_hidden = detach_hidden(train_hidden)
                     train_pred, train_hidden = model(ground_truth, train_hidden)
+                    prev_train_frame = ground_truth
 
                 # --- cosmetic preview: periodic anchor + self-feeding rollout ---
                 # Purely for the display pane; runs under no_grad and never
@@ -277,10 +316,14 @@ def main():
                 print("[krystalball] reset: clearing hidden/replay-buffer/optimizer state")
                 train_hidden = None
                 train_pred = None
+                prev_train_frame = None
                 display_hidden = None
                 display_pred = None
                 buffer.clear()
-                optimizer = make_optimizer(args.optimizer, model.parameters(), args.lr)
+                optimizer, lr_scheduler = make_optimizer_and_scheduler(
+                    args.optimizer, model.parameters(), args.lr,
+                    args.lr_warmup_steps, args.lr_warmup_start_factor,
+                )
                 loss_history.clear()
     finally:
         webcam.stop()
