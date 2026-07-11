@@ -32,8 +32,8 @@ class ConvLSTMCell(nn.Module):
 
 
 class Encoder(nn.Module):
-    """Two stride-2 convs: downsamples 4x before the recurrent core, so the
-    ConvLSTM operates on a small feature map instead of raw pixels."""
+    """Two stride-2 convs downsample 4x before the recurrent core, then a 1x1
+    conv adds capacity (channel-wise MLP) without changing spatial resolution."""
 
     def __init__(self, in_channels: int = 3, base_channels: int = 16):
         super().__init__()
@@ -41,6 +41,8 @@ class Encoder(nn.Module):
             nn.Conv2d(in_channels, base_channels, 3, stride=2, padding=1),
             nn.ReLU(inplace=True),
             nn.Conv2d(base_channels, base_channels * 2, 3, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(base_channels * 2, base_channels * 2, 1),
             nn.ReLU(inplace=True),
         )
         self.out_channels = base_channels * 2
@@ -50,12 +52,14 @@ class Encoder(nn.Module):
 
 
 class Decoder(nn.Module):
-    """Mirrors the encoder: two stride-2 transposed convs upsample the
-    recurrent hidden state back to the working resolution."""
+    """A 1x1 conv adds capacity to the recurrent hidden state, then mirrors
+    the encoder: two stride-2 transposed convs upsample back to working resolution."""
 
     def __init__(self, in_channels: int, base_channels: int = 16, out_channels: int = 3):
         super().__init__()
         self.net = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels, 1),
+            nn.ReLU(inplace=True),
             nn.ConvTranspose2d(in_channels, base_channels, 4, stride=2, padding=1),
             nn.ReLU(inplace=True),
             nn.ConvTranspose2d(base_channels, out_channels, 4, stride=2, padding=1),

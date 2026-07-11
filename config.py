@@ -24,7 +24,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--loss", choices=["mse"], default="mse",
                     help="Loss function between prediction and real frame (default: mse)")
     p.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto",
-                    help="Compute device; 'auto' picks cuda if available (default: auto)")
+                    help="Compute device; 'auto' picks GPU if available (default: auto)")
     p.add_argument("--loss-window", type=int, default=100,
                     help="Number of recent losses averaged for the on-screen readout (default: 100)")
+    p.add_argument("--real-frame-interval-sec", type=float, default=0.0,
+                    help="Initial seconds between real frames; 0 means every frame is real "
+                         "(default: 0). Adjustable live via the on-screen trackbar; converted "
+                         "to a frame count using the current FPS. Between real frames the model "
+                         "free-runs on its own predictions.")
+    p.add_argument("--real-frame-interval-max-sec", type=int, default=15,
+                    help="Upper bound (seconds) of the real-frame-interval trackbar (default: 15)")
     return p
