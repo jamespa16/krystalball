@@ -4,8 +4,8 @@ krystalball -- live webcam next-frame prediction, trained online in real time.
 Usage:
     uv sync
     uv run main.py [--camera-index 0] [--width 96] [--height 72] [--upscale 6]
-                   [--lr 1e-3] [--hidden-channels 32] [--optimizer adam] [--loss mse]
-                   [--real-frame-interval-sec 0]
+                   [--lr 1e-3] [--lstm-hidden-channels 128] [--optimizer adam]
+                   [--loss mse_ssim] [--real-frame-interval-frames 0]
     (run `uv run main.py --help` for the full list of flags)
 
 Keyboard controls (window must be focused):
@@ -15,17 +15,19 @@ Keyboard controls (window must be focused):
           Use this if training visibly diverges or goes unstable.
 
 On-screen slider:
-    "Real frame every (sec)" -- at 0 (default) every frame is trained on
-    immediately, the original 1:1 predict-then-learn behavior. Dragged
-    higher, incoming real frames are pushed into a small in-memory replay
-    buffer instead of being trained on right away; a separate training pass
-    drains that buffer at a steady one-frame-per-iteration pace, so every
-    real frame is still eventually trained on -- just delayed by roughly
-    the slider's interval, never discarded. The right (prediction) pane
-    keeps showing a live, purely cosmetic self-feeding rollout (reseeded
-    with the real frame periodically) so you can watch the model's
-    "imagination" drift between anchors; that rollout never affects
-    training, which only ever learns from real buffered frames.
+    "Real frame delay (frames)" -- snaps to whole-frame detents; its value
+    is shown live both on the slider and in the on-screen overlay ("delay
+    Nf"). At 0 (default) every frame is trained on immediately, the
+    original 1:1 predict-then-learn behavior. Dragged higher, incoming
+    real frames are pushed into a small in-memory replay buffer instead of
+    being trained on right away; a separate training pass drains that
+    buffer at a steady one-frame-per-iteration pace, so every real frame
+    is still eventually trained on -- just delayed by exactly that many
+    frames, never discarded. The right (prediction) pane keeps showing a
+    live, purely cosmetic self-feeding rollout (reseeded with the real
+    frame periodically) so you can watch the model's "imagination" drift
+    between anchors; that rollout never affects training, which only ever
+    learns from real buffered frames.
 
 What you'll see:
     One window, two panes side by side: [ real webcam frame | model's
@@ -74,10 +76,11 @@ def make_optimizer(name, params, lr):
 def main():
     args = build_arg_parser().parse_args()
 
-    if args.width % 4 != 0 or args.height % 4 != 0:
+    divisor = 2 ** args.encoder_scales
+    if args.width % divisor != 0 or args.height % divisor != 0:
         raise ValueError(
-            "--width and --height must both be divisible by 4 "
-            "(the encoder/decoder each downsample/upsample by 2x twice)."
+            f"--width and --height must both be divisible by {divisor} "
+            f"(the encoder/decoder downsample/upsample by 2x, {args.encoder_scales} times)."
         )
 
     if args.device == "auto":
@@ -92,9 +95,16 @@ def main():
         device = torch.device(args.device)
     print(f"[krystalball] device: {device}")
 
-    model = NextFramePredictor(hidden_channels=args.hidden_channels).to(device)
+    model = NextFramePredictor(
+        encoder_base_channels=args.encoder_base_channels,
+        encoder_scales=args.encoder_scales,
+        res_blocks_per_scale=args.res_blocks_per_scale,
+        lstm_hidden_channels=args.lstm_hidden_channels,
+        lstm_layers=args.lstm_layers,
+        delta_scale=args.delta_scale,
+    ).to(device)
     optimizer = make_optimizer(args.optimizer, model.parameters(), args.lr)
-    loss_fn = get_loss_fn(args.loss)
+    loss_fn = get_loss_fn(args.loss, ssim_weight=args.ssim_weight)
 
     webcam = WebcamStream(args.camera_index)
     print("[krystalball] waiting for first webcam frame...")
@@ -105,12 +115,12 @@ def main():
     window_name = "krystalball -- real | prediction"
     cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
 
-    trackbar_name = "Real frame every (sec)"
+    trackbar_name = "Real frame delay (frames)"
     cv2.createTrackbar(
         trackbar_name,
         window_name,
-        int(round(args.real_frame_interval_sec)),
-        args.real_frame_interval_max_sec,
+        args.real_frame_interval_frames,
+        args.real_frame_interval_max_frames,
         lambda _v: None,
     )
 
@@ -119,15 +129,15 @@ def main():
     train_hidden = None
     train_pred = None  # prediction awaiting the next buffered ground-truth frame
     # `display_hidden`/`display_pred` drive the on-screen preview only when
-    # buffering is active (interval > 0s); periodically reseeded with a real
-    # frame and self-fed in between. Purely cosmetic -- no gradient ever
-    # flows through this path.
+    # buffering is active (delay > 0 frames); periodically reseeded with a
+    # real frame and self-fed in between. Purely cosmetic -- no gradient
+    # ever flows through this path.
     display_hidden = None
     display_pred = None
-    # Replay buffer: real frames waiting to be trained on. At interval=0 it's
+    # Replay buffer: real frames waiting to be trained on. At delay=0 it's
     # unused (frames are trained on immediately); above 0 it holds roughly
-    # `interval_frames - 1` frames, drained one-per-iteration so every real
-    # frame is eventually trained on, just delayed.
+    # `target_lag` frames, drained one-per-iteration so every real frame is
+    # eventually trained on, just delayed.
     buffer = deque()
     loss_history = deque(maxlen=args.loss_window)
     frame_count = 0
@@ -142,21 +152,16 @@ def main():
             real_tensor = preprocess(raw_frame, args.width, args.height, device)
 
             # --- real-frame interval: how far training lags behind live video ---
-            # At 0s (default) every frame is trained on immediately, i.e. the
-            # original 1:1 behavior (no buffering at all). Above 0s, real
-            # frames are pushed into a replay buffer instead, and training
-            # drains that buffer at one frame per iteration, so it lags real
-            # time by roughly `target_lag` frames but still eventually trains
-            # on every single frame -- nothing is discarded. The interval is
-            # measured in frames using the current smoothed FPS since the
-            # slider is scaled in seconds.
-            interval_sec = cv2.getTrackbarPos(trackbar_name, window_name)
-            if interval_sec > 0:
-                assumed_fps = fps if fps > 0 else 30.0
-                interval_frames = max(1, round(interval_sec * assumed_fps))
-            else:
-                interval_frames = 1
-            target_lag = interval_frames - 1
+            # The trackbar snaps to whole-frame detents and its position *is*
+            # the target lag in frames -- at 0 (default) every frame is
+            # trained on immediately, i.e. the original 1:1 behavior (no
+            # buffering at all). Above 0, real frames are pushed into a
+            # replay buffer instead, and training drains that buffer at one
+            # frame per iteration, so it lags real time by exactly
+            # `target_lag` frames but still eventually trains on every single
+            # frame -- nothing is discarded.
+            target_lag = cv2.getTrackbarPos(trackbar_name, window_name)
+            interval_frames = target_lag + 1
 
             if interval_frames == 1:
                 # --- predict-then-learn, one step behind (no buffering) ---
@@ -164,6 +169,8 @@ def main():
                     loss = loss_fn(train_pred, real_tensor)
                     optimizer.zero_grad(set_to_none=True)
                     loss.backward()
+                    if args.grad_clip_norm > 0:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm)
                     optimizer.step()
                     loss_history.append(loss.item())
                     # Cut the graph so next timestep's backward can't walk
@@ -188,6 +195,8 @@ def main():
                         loss = loss_fn(train_pred, ground_truth)
                         optimizer.zero_grad(set_to_none=True)
                         loss.backward()
+                        if args.grad_clip_norm > 0:
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm)
                         optimizer.step()
                         loss_history.append(loss.item())
                         # Same one-timestep-only invariant as above, just
@@ -204,7 +213,12 @@ def main():
                     disp_input = (
                         real_tensor
                         if (is_anchor_step or display_pred is None)
-                        else display_pred
+                        # Clamp before self-feeding: the decoder's residual
+                        # output can drift outside [0, 1], and feeding an
+                        # out-of-distribution frame back in compounds across
+                        # rollout steps, so keep it on the manifold the model
+                        # was actually trained on.
+                        else display_pred.clamp(0, 1)
                     )
                     display_pred, display_hidden = model(disp_input, display_hidden)
                 pred_for_display = display_pred
@@ -229,7 +243,7 @@ def main():
             cv2.putText(
                 canvas,
                 f"frame {frame_count}  fps {fps:5.1f}  loss {avg_loss:.5f}  "
-                f"[{mode_label}]  buf {len(buffer)}/{target_lag}",
+                f"[{mode_label}]  delay {target_lag}f  buf {len(buffer)}/{target_lag}",
                 (10, 24),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.6,

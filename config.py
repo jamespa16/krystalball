@@ -7,31 +7,129 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="Live webcam next-frame prediction, trained online in real time."
     )
-    p.add_argument("--camera-index", type=int, default=0,
-                    help="OpenCV camera index (default: 0)")
-    p.add_argument("--width", type=int, default=96,
-                    help="Internal working width in pixels; must be divisible by 4 (default: 96)")
-    p.add_argument("--height", type=int, default=72,
-                    help="Internal working height in pixels; must be divisible by 4 (default: 72)")
-    p.add_argument("--upscale", type=int, default=6,
-                    help="Factor to upscale each pane by for display only (default: 6)")
-    p.add_argument("--lr", type=float, default=1e-3,
-                    help="Optimizer learning rate (default: 1e-3)")
-    p.add_argument("--hidden-channels", type=int, default=32,
-                    help="Channel count of the ConvLSTM hidden/cell state (default: 32)")
-    p.add_argument("--optimizer", choices=["adam", "sgd"], default="adam",
-                    help="Optimizer to use (default: adam)")
-    p.add_argument("--loss", choices=["mse"], default="mse",
-                    help="Loss function between prediction and real frame (default: mse)")
-    p.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto",
-                    help="Compute device; 'auto' picks GPU if available (default: auto)")
-    p.add_argument("--loss-window", type=int, default=100,
-                    help="Number of recent losses averaged for the on-screen readout (default: 100)")
-    p.add_argument("--real-frame-interval-sec", type=float, default=0.0,
-                    help="Initial seconds between real frames; 0 means every frame is real "
-                         "(default: 0). Adjustable live via the on-screen trackbar; converted "
-                         "to a frame count using the current FPS. Between real frames the model "
-                         "free-runs on its own predictions.")
-    p.add_argument("--real-frame-interval-max-sec", type=int, default=15,
-                    help="Upper bound (seconds) of the real-frame-interval trackbar (default: 15)")
+    p.add_argument(
+        "--camera-index", type=int, default=0, help="OpenCV camera index (default: 0)"
+    )
+    p.add_argument(
+        "--width",
+        type=int,
+        default=96,
+        help="Internal working width in pixels; must be divisible by 2**--encoder-scales "
+        "(default: 96, divisible by 8 for the default 3 scales)",
+    )
+    p.add_argument(
+        "--height",
+        type=int,
+        default=72,
+        help="Internal working height in pixels; must be divisible by 2**--encoder-scales "
+        "(default: 72, divisible by 8 for the default 3 scales)",
+    )
+    p.add_argument(
+        "--upscale",
+        type=int,
+        default=6,
+        help="Factor to upscale each pane by for display only (default: 6)",
+    )
+    p.add_argument(
+        "--lr", type=float, default=1e-3, help="Optimizer learning rate (default: 1e-3)"
+    )
+    p.add_argument(
+        "--encoder-base-channels",
+        type=int,
+        default=32,
+        help="Encoder first-stage channel count; doubles at each subsequent "
+        "downsample stage (default: 32, giving 32/64/128 for the default 3 scales)",
+    )
+    p.add_argument(
+        "--encoder-scales",
+        type=int,
+        default=3,
+        help="Number of stride-2 downsample stages in the encoder/decoder "
+        "(total spatial downsample = 2**this). --width/--height must be "
+        "divisible by 2**this (default: 3, i.e. divisible by 8)",
+    )
+    p.add_argument(
+        "--res-blocks-per-scale",
+        type=int,
+        default=1,
+        help="Number of GroupNorm residual blocks after each encoder downsample "
+        "/ before each decoder upsample (default: 1)",
+    )
+    p.add_argument(
+        "--lstm-layers",
+        type=int,
+        default=2,
+        help="Number of stacked ConvLSTM layers forming the recurrent temporal "
+        "core (default: 2)",
+    )
+    p.add_argument(
+        "--lstm-hidden-channels",
+        type=int,
+        default=128,
+        help="Hidden/cell channel count of each ConvLSTM layer, uniform across "
+        "all layers (default: 128)",
+    )
+    p.add_argument(
+        "--delta-scale",
+        type=float,
+        default=0.6,
+        help="Max per-step residual magnitude added to the input frame to form the "
+        "prediction (decoder outputs scale*tanh(x), default: 0.6). Lower values "
+        "keep free-running rollouts closer to the learned manifold (less drift) "
+        "at the cost of reacting more slowly to fast real motion.",
+    )
+    p.add_argument(
+        "--optimizer",
+        choices=["adam", "sgd"],
+        default="adam",
+        help="Optimizer to use (default: adam)",
+    )
+    p.add_argument(
+        "--loss",
+        choices=["mse", "ssim", "mse_ssim"],
+        default="mse_ssim",
+        help="Loss function between prediction and real frame (default: mse_ssim, "
+        "a blend of MSE and 1-SSIM -- see --ssim-weight)",
+    )
+    p.add_argument(
+        "--ssim-weight",
+        type=float,
+        default=0.5,
+        help="Blend weight for --loss mse_ssim: final = (1-w)*MSE + w*(1-SSIM). "
+        "Ignored for other --loss choices (default: 0.5)",
+    )
+    p.add_argument(
+        "--grad-clip-norm",
+        type=float,
+        default=1.0,
+        help="Max L2 norm for gradient clipping, applied after backward() and "
+        "before optimizer.step(); set to 0 to disable (default: 1.0)",
+    )
+    p.add_argument(
+        "--device",
+        choices=["auto", "cpu", "cuda", "mps"],
+        default="auto",
+        help="Compute device; 'auto' picks GPU/MPS if available (default: auto)",
+    )
+    p.add_argument(
+        "--loss-window",
+        type=int,
+        default=100,
+        help="Number of recent losses averaged for the on-screen readout (default: 100)",
+    )
+    p.add_argument(
+        "--real-frame-interval-frames",
+        type=int,
+        default=0,
+        help="Initial real-frame delay in frames; 0 means every frame is real "
+        "(default: 0). Adjustable live via the on-screen trackbar, which snaps "
+        "to whole-frame detents and shows the current value. Between real "
+        "frames the model free-runs on its own predictions.",
+    )
+    p.add_argument(
+        "--real-frame-interval-max-frames",
+        type=int,
+        default=60,
+        help="Upper bound (frames) of the real-frame-interval trackbar (default: 60)",
+    )
     return p

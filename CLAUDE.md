@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project status
 
-v1 (immediate 1:1 predict-then-learn) and v2 (adjustable real-frame-interval replay buffer) are both implemented across `main.py` (entrypoint/training loop), `model.py`, `webcam.py`, `config.py`, and `requirements.txt`. Treat `idea.md` as the authoritative spec for any future changes.
+v1 (immediate 1:1 predict-then-learn), v2 (adjustable real-frame-interval replay buffer), and v3 (deeper multi-scale U-Net-style encoder/decoder + stacked ConvLSTM temporal core + GroupNorm residual blocks + SSIM/blended loss + gradient clipping) are all implemented across `main.py` (entrypoint/training loop), `model.py`, `webcam.py`, `config.py`, and `requirements.txt`. Treat `idea.md` as the authoritative spec for any future changes.
 
 ## What this project is
 
@@ -20,7 +20,7 @@ Key behavioral requirements from the spec (do not silently drop these when imple
 - Auto-detect GPU, fall back to CPU.
 - Loss function should be swappable (MSE baseline, but structure so SSIM/perceptual loss can replace it later).
 - Runs indefinitely; `q` quits and releases the camera cleanly, `r` resets recurrent hidden state + optimizer state + replay buffer without restarting the process.
-- **Real-frame interval is adjustable live** via an in-window OpenCV trackbar ("Real frame every (sec)"): at 0 the model trains on every frame immediately (original 1:1 behavior); above 0, real frames are pushed into a small in-memory FIFO replay buffer and drained one-per-iteration by training, so training lags real time by roughly the slider's interval but still eventually trains on *every* frame — nothing is discarded. This is `main.py`'s `train_hidden`/`train_pred`/`buffer` path.
+- **Real-frame delay is adjustable live** via an in-window OpenCV trackbar ("Real frame delay (frames)") that snaps to whole-frame detents and shows the current value (also echoed in the on-screen overlay): at 0 the model trains on every frame immediately (original 1:1 behavior); above 0, real frames are pushed into a small in-memory FIFO replay buffer and drained one-per-iteration by training, so training lags real time by exactly that many frames but still eventually trains on *every* frame — nothing is discarded. This is `main.py`'s `train_hidden`/`train_pred`/`buffer` path.
 - **The display's prediction pane is cosmetically separate from training** when buffering is active: it runs its own periodically-reseeded self-feeding rollout (`display_hidden`/`display_pred`, under `torch.no_grad()`) purely so the preview looks live; it never produces gradients and never touches the replay buffer. This is the one narrow, sanctioned form of multi-step rollout — see idea.md's Core behavior and Non-goals sections.
 - No disk-backed dataset/checkpointing/optical flow/standalone N-steps-ahead rollout API/config UI beyond the one trackbar above — explicitly out of scope (see idea.md's Non-goals section before adding any of these). The replay buffer itself is in-scope but stays a small bounded in-memory FIFO queue, not a persisted dataset.
 
@@ -28,7 +28,7 @@ Key behavioral requirements from the spec (do not silently drop these when imple
 
 - Python, PyTorch (model/training), OpenCV `cv2` (webcam capture + display window).
 - Dependencies (torch, opencv-python, numpy) are managed by `uv` via `pyproject.toml`/`uv.lock`.
-- Config values (camera index, working resolution, display upscale factor, learning rate, hidden channel count, optimizer, real-frame interval) should be exposed as easily editable constants or CLI flags, not buried in logic.
+- Config values (camera index, working resolution, display upscale factor, learning rate, encoder depth/channel counts, ConvLSTM layer count/hidden channels, optimizer, loss choice/blend weight, gradient-clip norm, real-frame interval) should be exposed as easily editable constants or CLI flags, not buried in logic.
 
 ## Commands
 
@@ -45,7 +45,7 @@ No lint/test tooling exists yet.
 
 ## Code layout
 
-- `config.py` — argparse CLI flags / defaults (camera index, resolution, lr, hidden channels, optimizer, loss).
-- `model.py` — `Encoder` / `ConvLSTMCell` / `Decoder` / `NextFramePredictor`, plus `detach_hidden()` and the `get_loss_fn()` swappable-loss factory.
+- `config.py` — argparse CLI flags / defaults (camera index, resolution, lr, encoder scales/channels/res-blocks, ConvLSTM layers/hidden channels, optimizer, loss choice + SSIM blend weight, gradient-clip norm).
+- `model.py` — multi-scale U-Net-style `Encoder` / `Decoder` (GroupNorm `ResBlock`s via `DownBlock`/`UpBlock`, one skip connection per scale) → `ConvLSTMStack` (stacked multi-layer `ConvLSTMCell`s; hidden state is `list[(h, c)]`, one tuple per layer) → `NextFramePredictor`, plus `detach_hidden()` (generalized to the per-layer hidden-state list) and the `get_loss_fn()` swappable-loss factory (`mse` / `ssim` / `mse_ssim`, the last via `SSIMLoss`/`BlendedLoss`).
 - `webcam.py` — `WebcamStream`: background-thread capture with a lock-protected latest-frame buffer.
 - `main.py` — entrypoint; owns the predict-then-learn training loop, display compositing/overlay, and `q`/`r` key handling.
