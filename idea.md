@@ -21,10 +21,10 @@ Build a Python application that trains a neural network **online, in real time**
 
 - **Language/stack:** Python, PyTorch for the model, OpenCV (`cv2`) for webcam capture and display.
 - **Resolution:** Internally downsample webcam frames to a small working resolution (start around 96×72, must be easily configurable) so that training keeps pace with the live video framerate. Upscale only for display, not for training.
-- **Model architecture:** A small encoder → recurrent temporal core (ConvLSTM or equivalent) → decoder network that outputs a predicted RGB frame. The recurrent core must carry state across frames so predictions use motion history, not just the current static frame.
+- **Model architecture:** A small encoder → recurrent temporal core (ConvLSTM or equivalent) → decoder network that outputs a predicted RGB frame, plus a learned optical-flow head that warps the current frame (and encoder skip activations) forward under a constant-velocity assumption to form the decoder's residual base. The recurrent core must carry state across frames so predictions use motion history, not just the current static frame — this now means recurrence at *both* the coarsest bottleneck scale *and* each encoder skip-connection scale (a per-scale bank of independent ConvLSTM cells), not just the bottleneck alone, since skip-only-feedforward connections cap how well fast/fine motion detail can be tracked. The flow head is also fed its own previous flow estimate each step (in addition to the current/previous frame pair) so its estimate is refined/smoothed across steps instead of re-derived from scratch every frame.
 - **Device:** Auto-detect and use GPU if available, otherwise fall back to CPU.
 - **Threading:** Webcam reads must happen on a background thread with a small lock-protected "latest frame" buffer, so training/inference is never blocked waiting on `cap.read()`.
-- **Loss function:** MSE between predicted and actual frame is the baseline; structure the code so the loss function is easy to swap out later (e.g., for an SSIM or perceptual loss).
+- **Loss function:** MSE between predicted and actual frame is the baseline; structure the code so the loss function is easy to swap out later (e.g., for an SSIM or perceptual loss). The final training loss is this swappable base loss plus two optional additive auxiliary terms: an edge-aware smoothness/total-variation regularizer on the predicted flow field (the flow head has no direct supervision otherwise, only the indirect signal from downstream photometric reconstruction), and a motion-magnitude term that supervises the predicted *amount* of frame-to-frame change against the actual amount — distinct from the existing per-pixel motion-weighted reweighting, which only reweights the base loss rather than adding a new signal.
 - **State detachment:** Detach the recurrent hidden state from the autograd graph after each optimizer step, so backprop only spans one timestep (avoid unbounded graph growth / memory blowup from training on an indefinitely long sequence).
 - **No offline/external dataset** — training data is exclusively the live camera stream. Frames are either trained on immediately or briefly held in the bounded in-memory replay buffer described above; nothing is ever persisted to disk or survives a process restart.
 
@@ -34,6 +34,10 @@ Build a Python application that trains a neural network **online, in real time**
 - Display upscale factor
 - Learning rate
 - Hidden channel count of the recurrent core
+- ConvLSTM kernel size
+- Per-skip-scale recurrent hidden-channel base (0 disables skip recurrence, falling back to feedforward-only skips)
+- Flow-smoothness regularization weight
+- Motion-magnitude supervision weight
 - Optimizer choice (default Adam)
 - Real-frame delay in frames (default 0 = every frame is real, i.e. the original 1:1 behavior), adjustable live via an in-window OpenCV trackbar that snaps to whole-frame detents and shows the current frame-delay value.
 
@@ -41,7 +45,7 @@ Build a Python application that trains a neural network **online, in real time**
 - General-purpose long-horizon rollout as a standalone feature (e.g. an API to query "predict N frames ahead" on demand) — the only rollout is the cosmetic display preview described above, which never feeds back into training
 - Saving/loading model checkpoints
 - Any dataset collection, disk-backed persistence, or offline pretraining from sources other than the live camera. The replay buffer is a small, bounded, in-memory FIFO queue only (sized by the real-frame-interval slider) — it is a latency/scheduling mechanism, not a dataset: it doesn't persist across restarts, isn't shuffled/sampled from, and every frame is consumed in strict arrival order exactly once
-- Optical flow or other auxiliary input features
+- Additional auxiliary input modalities beyond the in-scope learned optical-flow head (e.g. depth, segmentation, audio) — optical flow itself is in-scope, see Model architecture
 - Any GUI beyond the single OpenCV display window and its trackbar (no separate config panel, no web frontend)
 
 ## Deliverable

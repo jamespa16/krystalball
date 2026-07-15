@@ -84,6 +84,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "all layers (default: 128)",
     )
     p.add_argument(
+        "--lstm-kernel-size",
+        type=int,
+        default=3,
+        help="Convolution kernel size for every ConvLSTM gate (bottleneck stack "
+        "and, if enabled, per-scale skip cells) (default: 3). Larger kernels "
+        "widen each cell's per-step receptive field at extra compute cost.",
+    )
+    p.add_argument(
+        "--skip-lstm-base-channels",
+        type=int,
+        default=16,
+        help="Hidden channel count of the first (highest-resolution) per-scale "
+        "ConvLSTM cell attached to each encoder skip connection, doubling per "
+        "scale like the encoder's own channel progression (default: 16). Today "
+        "skip connections are purely feedforward with no temporal memory of "
+        "their own; this gives each scale its own recurrent state so fast/fine "
+        "motion detail isn't limited to whatever the single coarsest bottleneck "
+        "scale can represent. Set to 0 to disable (today's feedforward-only "
+        "skip behavior).",
+    )
+    p.add_argument(
         "--delta-scale",
         type=float,
         default=0.6,
@@ -107,6 +128,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=16,
         help="Hidden channel count of the flow-prediction submodule (default: 16). "
         "Lower this if --use-flow on measurably hurts CPU framerate.",
+    )
+    p.add_argument(
+        "--flow-smoothness-weight",
+        type=float,
+        default=0.01,
+        help="Edge-aware total-variation regularization weight on the predicted "
+        "flow field (units: raw pixel-displacement, a much larger scale than the "
+        "photometric loss -- keep this small) (default: 0.01). Too large a value "
+        "can collapse flow back toward the zero-init trivial solution. Set to 0 "
+        "to disable. Ignored when --use-flow off.",
     )
     p.add_argument(
         "--blend-mask",
@@ -146,6 +177,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "training frame, on top of a base weight of 1 (default: 1.0, giving moving "
         "regions ~2x the static background's average gradient weight). Set to 0 to "
         "disable (uniform per-pixel weighting, today's behavior).",
+    )
+    p.add_argument(
+        "--motion-delta-weight",
+        type=float,
+        default=0.5,
+        help="Extra loss term matching the magnitude of predicted frame-to-frame "
+        "change to actual change (|pred - prev_frame| vs |target - prev_frame|), "
+        "distinct from --motion-loss-weight (which only reweights the existing "
+        "photometric loss, it doesn't add a new term) -- directly supervises "
+        "whether the model predicts the right amount of motion, not just correct "
+        "final pixels (default: 0.5). Set to 0 to disable.",
     )
     p.add_argument(
         "--grad-clip-norm",

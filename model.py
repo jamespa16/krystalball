@@ -78,22 +78,26 @@ class UpBlock(nn.Module):
 
 class FlowHead(nn.Module):
     """Predicts a dense 2-channel (dx, dy) flow field from a (prev, curr)
-    frame pair. Small conv encoder-decoder reusing DownBlock/UpBlock for
-    consistency with the main Encoder/Decoder. The final conv is
-    zero-initialized so a fresh model predicts exactly zero flow (identity
-    warp), mirroring the zero-init trick on Decoder.final_up."""
+    frame pair, refined against the previous step's flow estimate rather
+    than re-derived from scratch every frame -- reduces frame-to-frame
+    flow jitter, since the field is otherwise supervised only indirectly
+    through the downstream photometric loss. Small conv encoder-decoder
+    reusing DownBlock/UpBlock for consistency with the main Encoder/
+    Decoder. The final conv is zero-initialized so a fresh model predicts
+    exactly zero flow (identity warp), mirroring the zero-init trick on
+    Decoder.final_up."""
 
     def __init__(self, in_channels: int = 6, hidden_channels: int = 16):
         super().__init__()
-        self.in_conv = nn.Conv2d(in_channels, hidden_channels, 3, padding=1)
+        self.in_conv = nn.Conv2d(in_channels + 2, hidden_channels, 3, padding=1)
         self.down = DownBlock(hidden_channels, hidden_channels * 2, num_res_blocks=1)
         self.up = UpBlock(hidden_channels * 2, hidden_channels, hidden_channels, num_res_blocks=1)
         self.out_conv = nn.Conv2d(hidden_channels, 2, 3, padding=1)
         nn.init.zeros_(self.out_conv.weight)
         nn.init.zeros_(self.out_conv.bias)
 
-    def forward(self, prev_frame, curr_frame):
-        x = self.in_conv(torch.cat([prev_frame, curr_frame], dim=1))
+    def forward(self, prev_frame, curr_frame, prev_flow):
+        x = self.in_conv(torch.cat([prev_frame, curr_frame, prev_flow], dim=1))
         skip = x
         x = self.down(x)
         x = self.up(x, skip)
@@ -185,6 +189,41 @@ class ConvLSTMStack(nn.Module):
 
     def init_hidden(self, batch_size, height, width, device):
         return [cell.init_hidden(batch_size, height, width, device) for cell in self.cells]
+
+
+class SkipConvLSTMBank(nn.Module):
+    """One independent ConvLSTMCell per encoder skip scale -- a parallel
+    bank, not a sequential stack like ConvLSTMStack (skip scales have no
+    layer-feeds-layer relationship to each other, unlike stacked-RNN
+    depth). Without this, every skip connection is purely feedforward (or
+    flow-warped) with zero learned memory of its own, and all temporal
+    memory lives at the single coarsest bottleneck scale -- the main cap
+    on tracking fast/fine motion. Each cell gets its own private hidden
+    state, threaded alongside the bottleneck stack's in the model's
+    overall hidden tuple."""
+
+    def __init__(self, in_channels_list: list, hidden_channels_list: list, kernel_size: int = 3):
+        super().__init__()
+        self.cells = nn.ModuleList([
+            ConvLSTMCell(c_in, c_hidden, kernel_size)
+            for c_in, c_hidden in zip(in_channels_list, hidden_channels_list)
+        ])
+
+    def forward(self, xs: list, hiddens):
+        if hiddens is None:
+            hiddens = self.init_hidden(xs)
+        new_hiddens, outs = [], []
+        for cell, x, h in zip(self.cells, xs, hiddens):
+            h_new, c_new = cell(x, h)
+            new_hiddens.append((h_new, c_new))
+            outs.append(h_new)
+        return outs, new_hiddens
+
+    def init_hidden(self, xs: list):
+        return [
+            cell.init_hidden(x.shape[0], x.shape[2], x.shape[3], x.device)
+            for cell, x in zip(self.cells, xs)
+        ]
 
 
 class Encoder(nn.Module):
@@ -282,19 +321,25 @@ class Decoder(nn.Module):
 
 
 class NextFramePredictor(nn.Module):
-    """(flow-warp) -> encoder -> stacked ConvLSTM -> decoder. Carries
-    recurrent state across calls so predictions are conditioned on motion
-    history, not a single frame. `hidden` is None or (lstm_hidden,
-    prev_frame): lstm_hidden is list[(h, c)] (one tuple per ConvLSTM
-    layer), prev_frame is the raw input tensor from the previous call, used
-    to compute optical flow to the current frame."""
+    """(flow-warp) -> encoder -> stacked ConvLSTM (+ per-skip-scale
+    ConvLSTM bank) -> decoder. Carries recurrent state across calls so
+    predictions are conditioned on motion history, not a single frame,
+    now at multiple resolutions rather than only the coarsest bottleneck.
+    `hidden` is None or (bottleneck_hidden, skip_hiddens, prev_frame,
+    prev_flow): bottleneck_hidden is list[(h, c)] (one tuple per
+    ConvLSTM layer), skip_hiddens is list[(h, c)] (one tuple per encoder
+    skip scale, or None entries if skip recurrence is disabled),
+    prev_frame is the raw input tensor from the previous call (used to
+    compute optical flow to the current frame), prev_flow is the
+    previous step's flow field (used to refine, not re-derive, the next
+    flow estimate)."""
 
     def __init__(self, in_channels: int = 3, encoder_base_channels: int = 32,
                  encoder_scales: int = 3, res_blocks_per_scale: int = 1,
                  lstm_hidden_channels: int = 128, lstm_layers: int = 2,
                  kernel_size: int = 3, delta_scale: float = 0.6,
                  use_flow: bool = True, flow_hidden_channels: int = 16,
-                 use_blend_mask: bool = True):
+                 use_blend_mask: bool = True, skip_lstm_base_channels: int = 16):
         super().__init__()
         self.use_flow = use_flow
         if use_flow:
@@ -306,24 +351,56 @@ class NextFramePredictor(nn.Module):
         self.lstm = ConvLSTMStack(
             self.encoder.out_channels, [lstm_hidden_channels] * lstm_layers, kernel_size
         )
+        self.use_skip_recurrence = skip_lstm_base_channels > 0 and len(self.encoder.skip_channels) > 0
+        if self.use_skip_recurrence:
+            skip_lstm_hidden = [
+                skip_lstm_base_channels * (2 ** i) for i in range(len(self.encoder.skip_channels))
+            ]
+            self.skip_lstm = SkipConvLSTMBank(
+                self.encoder.skip_channels, skip_lstm_hidden, kernel_size
+            )
+            decoder_skip_channels = skip_lstm_hidden
+        else:
+            decoder_skip_channels = self.encoder.skip_channels
         self.decoder = Decoder(
-            self.lstm.out_channels, self.encoder.skip_channels, encoder_base_channels,
+            self.lstm.out_channels, decoder_skip_channels, encoder_base_channels,
             in_channels, delta_scale, res_blocks_per_scale, use_blend_mask
         )
 
     def forward(self, x, hidden):
-        lstm_hidden, prev_frame = hidden if hidden is not None else (None, None)
+        if hidden is None:
+            bottleneck_hidden, skip_hiddens, prev_frame, prev_flow = None, None, None, None
+        else:
+            bottleneck_hidden, skip_hiddens, prev_frame, prev_flow = hidden
+
         if self.use_flow:
             if prev_frame is not None:
-                flow = self.flow_head(prev_frame, x)
+                if prev_flow is None:
+                    prev_flow = torch.zeros(
+                        x.shape[0], 2, x.shape[2], x.shape[3], device=x.device, dtype=x.dtype
+                    )
+                flow = self.flow_head(prev_frame, x, prev_flow)
                 warped = warp_frame(x, flow)
             else:
                 flow = torch.zeros(x.shape[0], 2, x.shape[2], x.shape[3], device=x.device, dtype=x.dtype)
                 warped = x
             encoder_in = torch.cat([x, flow], dim=1)
         else:
+            flow = None
             warped, encoder_in = x, x
+
         features, skips = self.encoder(encoder_in)
+
+        if self.use_skip_recurrence:
+            # Recurrence runs on the raw, unwarped skip activations, so the
+            # stored hidden state always lives in one stable coordinate
+            # frame -- warping is applied only to the ephemeral per-step
+            # output below (discarded after the decoder consumes it), never
+            # fed back in as next step's input. Feeding warped output back
+            # in would re-resample an already-resampled tensor every step,
+            # compounding bilinear blur over a long-running session.
+            skips, skip_hiddens = self.skip_lstm(skips, skip_hiddens)
+
         if self.use_flow and prev_frame is not None:
             # Skip features were captured from the current (unwarped) frame,
             # but base_frame is now motion-extrapolated -- warp the skips by
@@ -331,9 +408,10 @@ class NextFramePredictor(nn.Module):
             # spatially consistent with the predicted-frame geometry instead
             # of ghosting at moving edges.
             skips = [warp_frame(skip, _resize_flow(flow, skip.shape[2:])) for skip in skips]
-        top_h, lstm_hidden = self.lstm(features, lstm_hidden)
+
+        top_h, bottleneck_hidden = self.lstm(features, bottleneck_hidden)
         pred = self.decoder(top_h, skips, warped)
-        return pred, (lstm_hidden, x)
+        return pred, (bottleneck_hidden, skip_hiddens, x, flow), flow
 
 
 def detach_hidden(hidden):
@@ -371,6 +449,43 @@ def motion_weight_map(frame_t: torch.Tensor, frame_prev: torch.Tensor,
     diff = (frame_t - frame_prev).abs().mean(dim=1, keepdim=True)
     denom = diff.mean(dim=(1, 2, 3), keepdim=True).clamp_min(1e-4)
     return 1.0 + motion_loss_weight * (diff / denom)
+
+
+def flow_smoothness_loss(flow: torch.Tensor, image: torch.Tensor) -> torch.Tensor:
+    """Edge-aware total-variation regularizer on the flow field: penalizes
+    flow discontinuities except where the image itself has an edge (motion
+    boundaries legitimately coincide with object edges). Needed because
+    FlowHead is supervised only indirectly through downstream photometric
+    reconstruction (see FlowHead/NextFramePredictor.forward) -- in
+    textureless or occluded regions there's no data term to anchor the
+    flow at all, so without this it can drift to noisy/degenerate values.
+    `image` is detached: no gradient should flow into the edge-weight
+    computation, only into the flow field being regularized."""
+    image = image.detach()
+    dx_flow = flow[:, :, :, 1:] - flow[:, :, :, :-1]
+    dy_flow = flow[:, :, 1:, :] - flow[:, :, :-1, :]
+    dx_img = image[:, :, :, 1:] - image[:, :, :, :-1]
+    dy_img = image[:, :, 1:, :] - image[:, :, :-1, :]
+    w_x = torch.exp(-dx_img.abs().mean(dim=1, keepdim=True))
+    w_y = torch.exp(-dy_img.abs().mean(dim=1, keepdim=True))
+    return (dx_flow.abs() * w_x).mean() + (dy_flow.abs() * w_y).mean()
+
+
+def motion_delta_loss(pred: torch.Tensor, target: torch.Tensor,
+                       prev_frame: torch.Tensor) -> torch.Tensor:
+    """Supervises the *magnitude* of predicted frame-to-frame change against
+    actual change, complementary to motion_weight_map's pixel-reweighting
+    (which only reweights the base photometric loss, it doesn't add a new
+    signal). Comparing (pred - prev) to (target - prev) directly under any
+    pointwise norm would be mathematically identical to comparing (pred,
+    target) directly -- subtracting the same prev_frame from both sides
+    cancels out exactly. Taking .abs() before differencing is what makes
+    this a genuinely distinct signal: it matches the *amount* of change
+    regardless of direction/color, isolated from whether exact final pixel
+    values are right (already covered by the base loss)."""
+    pred_delta = (pred - prev_frame).abs()
+    real_delta = (target - prev_frame).abs()
+    return F.mse_loss(pred_delta, real_delta)
 
 
 class WeightedMSELoss(nn.Module):

@@ -46,7 +46,14 @@ import numpy as np
 import torch
 
 from config import build_arg_parser
-from model import NextFramePredictor, detach_hidden, get_loss_fn, motion_weight_map
+from model import (
+    NextFramePredictor,
+    detach_hidden,
+    flow_smoothness_loss,
+    get_loss_fn,
+    motion_delta_loss,
+    motion_weight_map,
+)
 from webcam import WebcamStream
 
 
@@ -89,6 +96,21 @@ def make_optimizer_and_scheduler(name, params, lr, warmup_steps, warmup_start_fa
     return optimizer, scheduler
 
 
+def compute_training_loss(loss_fn, pred, target, prev_frame, flow, args):
+    """Composes the swappable base photometric loss with the two optional
+    additive auxiliary terms (flow smoothness, motion-delta magnitude),
+    shared by both the delay=0 and buffered training branches."""
+    weight_map = None
+    if args.motion_loss_weight > 0:
+        weight_map = motion_weight_map(target, prev_frame, args.motion_loss_weight)
+    loss = loss_fn(pred, target, weight_map=weight_map)
+    if args.flow_smoothness_weight > 0 and flow is not None:
+        loss = loss + args.flow_smoothness_weight * flow_smoothness_loss(flow, prev_frame)
+    if args.motion_delta_weight > 0:
+        loss = loss + args.motion_delta_weight * motion_delta_loss(pred, target, prev_frame)
+    return loss
+
+
 def main():
     args = build_arg_parser().parse_args()
 
@@ -117,10 +139,12 @@ def main():
         res_blocks_per_scale=args.res_blocks_per_scale,
         lstm_hidden_channels=args.lstm_hidden_channels,
         lstm_layers=args.lstm_layers,
+        kernel_size=args.lstm_kernel_size,
         delta_scale=args.delta_scale,
         use_flow=args.use_flow == "on",
         flow_hidden_channels=args.flow_hidden_channels,
         use_blend_mask=args.blend_mask == "on",
+        skip_lstm_base_channels=args.skip_lstm_base_channels,
     ).to(device)
     optimizer, lr_scheduler = make_optimizer_and_scheduler(
         args.optimizer, model.parameters(), args.lr,
@@ -150,6 +174,7 @@ def main():
     # (buffered) frames, never the model's own predictions.
     train_hidden = None
     train_pred = None  # prediction awaiting the next buffered ground-truth frame
+    train_flow = None  # flow field from the last train-path forward call, for the flow-smoothness loss
     prev_train_frame = None  # previous training-consumed frame, for motion-weighted loss
     # `display_hidden`/`display_pred` drive the on-screen preview only when
     # buffering is active (delay > 0 frames); periodically reseeded with a
@@ -189,12 +214,9 @@ def main():
             if interval_frames == 1:
                 # --- predict-then-learn, one step behind (no buffering) ---
                 if train_pred is not None:
-                    weight_map = None
-                    if args.motion_loss_weight > 0:
-                        weight_map = motion_weight_map(
-                            real_tensor, prev_train_frame, args.motion_loss_weight
-                        )
-                    loss = loss_fn(train_pred, real_tensor, weight_map=weight_map)
+                    loss = compute_training_loss(
+                        loss_fn, train_pred, real_tensor, prev_train_frame, train_flow, args
+                    )
                     optimizer.zero_grad(set_to_none=True)
                     loss.backward()
                     if args.grad_clip_norm > 0:
@@ -206,7 +228,7 @@ def main():
                     # Cut the graph so next timestep's backward can't walk
                     # back through this one -- backprop spans exactly one step.
                     train_hidden = detach_hidden(train_hidden)
-                train_pred, train_hidden = model(real_tensor, train_hidden)
+                train_pred, train_hidden, train_flow = model(real_tensor, train_hidden)
                 prev_train_frame = real_tensor
                 pred_for_display = train_pred
                 is_anchor_step = True
@@ -223,12 +245,9 @@ def main():
                 while len(buffer) > target_lag:
                     ground_truth = buffer.popleft()
                     if train_pred is not None:
-                        weight_map = None
-                        if args.motion_loss_weight > 0:
-                            weight_map = motion_weight_map(
-                                ground_truth, prev_train_frame, args.motion_loss_weight
-                            )
-                        loss = loss_fn(train_pred, ground_truth, weight_map=weight_map)
+                        loss = compute_training_loss(
+                            loss_fn, train_pred, ground_truth, prev_train_frame, train_flow, args
+                        )
                         optimizer.zero_grad(set_to_none=True)
                         loss.backward()
                         if args.grad_clip_norm > 0:
@@ -241,7 +260,7 @@ def main():
                         # applied to a delayed (buffered) ground truth frame
                         # instead of the live one.
                         train_hidden = detach_hidden(train_hidden)
-                    train_pred, train_hidden = model(ground_truth, train_hidden)
+                    train_pred, train_hidden, train_flow = model(ground_truth, train_hidden)
                     prev_train_frame = ground_truth
 
                 # --- cosmetic preview: periodic anchor + self-feeding rollout ---
@@ -259,7 +278,7 @@ def main():
                         # was actually trained on.
                         else display_pred.clamp(0, 1)
                     )
-                    display_pred, display_hidden = model(disp_input, display_hidden)
+                    display_pred, display_hidden, _ = model(disp_input, display_hidden)
                 pred_for_display = display_pred
 
             # --- display ---
@@ -316,6 +335,7 @@ def main():
                 print("[krystalball] reset: clearing hidden/replay-buffer/optimizer state")
                 train_hidden = None
                 train_pred = None
+                train_flow = None
                 prev_train_frame = None
                 display_hidden = None
                 display_pred = None
