@@ -2,3 +2,7 @@ __pycache__/
 *.pyc
 venv/
 .venv/
+
+# Self-signed TLS cert/key for local LAN HTTPS (getUserMedia secure-context
+# requirement) -- generate your own, see README/CLAUDE.md.
+*.pem

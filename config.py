@@ -8,7 +8,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
         description="Live webcam next-frame prediction, trained online in real time."
     )
     p.add_argument(
-        "--camera-index", type=int, default=0, help="OpenCV camera index (default: 0)"
+        "--host",
+        type=str,
+        default="0.0.0.0",
+        help="Interface for the web server to bind to (default: 0.0.0.0, i.e. all interfaces)",
+    )
+    p.add_argument(
+        "--port", type=int, default=8000, help="Port for the web server to listen on (default: 8000)"
+    )
+    p.add_argument(
+        "--ssl-keyfile",
+        type=str,
+        default=None,
+        help="Path to a TLS private key (PEM). Required for browser webcam access "
+        "from any origin other than localhost -- see README for how to generate a "
+        "self-signed cert. Omit to serve plain HTTP (fine for localhost-only use).",
+    )
+    p.add_argument(
+        "--ssl-certfile",
+        type=str,
+        default=None,
+        help="Path to a TLS certificate (PEM), paired with --ssl-keyfile.",
     )
     p.add_argument(
         "--width",

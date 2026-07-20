@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>krystalball</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <h1>krystalball -- real | prediction</h1>
+
+  <video id="video" autoplay playsinline muted style="display: none"></video>
+
+  <div class="panes">
+    <div class="pane">
+      <canvas id="realCanvas"></canvas>
+      <div class="pane-label">real</div>
+    </div>
+    <div class="pane">
+      <canvas id="predCanvas"></canvas>
+      <div class="pane-label">prediction</div>
+    </div>
+  </div>
+
+  <div id="stats" class="stats">connecting...</div>
+
+  <div class="controls">
+    <label for="delaySlider">Real frame delay (frames): <span id="delayValue">0</span></label>
+    <input type="range" id="delaySlider" min="0" max="60" step="1" value="0" />
+    <button id="resetBtn">Reset</button>
+    <button id="stopBtn">Stop</button>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

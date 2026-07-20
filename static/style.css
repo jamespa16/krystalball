@@ -1,0 +1,94 @@
+:root {
+  color-scheme: dark;
+  --bg: #111318;
+  --fg: #e6e6e6;
+  --accent: #4ade80;
+  --panel: #1b1e26;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: system-ui, sans-serif;
+  margin: 0;
+  padding: 1.5rem;
+}
+
+h1 {
+  font-size: 1.1rem;
+  font-weight: 600;
+  margin: 0 0 1rem;
+  color: var(--accent);
+}
+
+.panes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+}
+
+.pane {
+  position: relative;
+  background: var(--panel);
+  border-radius: 8px;
+  padding: 0.5rem;
+}
+
+.pane canvas {
+  display: block;
+  max-width: 100%;
+  height: auto;
+}
+
+/* The prediction pane is upsampled from a tiny internal-resolution frame,
+   so it should look blocky (nearest-neighbor), matching the old cv2
+   INTER_NEAREST display upscale; the real pane is drawn directly from the
+   video element at full display resolution and stays smooth. */
+#predCanvas {
+  image-rendering: pixelated;
+}
+
+.pane-label {
+  position: absolute;
+  bottom: 0.75rem;
+  left: 0.75rem;
+  color: var(--accent);
+  font-size: 0.8rem;
+  text-shadow: 0 1px 2px black;
+}
+
+.stats {
+  margin-top: 1rem;
+  font-family: ui-monospace, monospace;
+  font-size: 0.85rem;
+  color: var(--accent);
+}
+
+.controls {
+  margin-top: 1rem;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.controls input[type="range"] {
+  width: 240px;
+}
+
+.controls button {
+  background: var(--panel);
+  color: var(--fg);
+  border: 1px solid #333;
+  border-radius: 6px;
+  padding: 0.4rem 0.9rem;
+  cursor: pointer;
+}
+
+.controls button:hover {
+  border-color: var(--accent);
+}

@@ -4,7 +4,9 @@ version = "0.1.0"
 description = "Live webcam next-frame prediction, trained online in real time."
 requires-python = ">=3.10"
 dependencies = [
+    "fastapi>=0.139.2",
     "numpy>=2.2.6",
     "opencv-python>=5.0.0.93",
     "torch>=2.13.0",
+    "uvicorn[standard]>=0.51.0",
 ]
