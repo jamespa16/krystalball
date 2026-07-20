@@ -1,10 +1,40 @@
-"""Multi-scale U-Net Encoder -> stacked ConvLSTM -> multi-scale Decoder
-next-frame predictor, with GroupNorm residual blocks, plus a swappable
-loss factory (MSE / SSIM / blended)."""
+"""Multi-scale U-Net Encoder -> hierarchical spatiotemporal-LSTM (PredRNN-
+style dual C/M memory, spanning skip scales and bottleneck depth) ->
+multi-scale Decoder next-frame predictor, with GroupNorm residual blocks,
+an acceleration-aware optical-flow head, plus a swappable loss factory
+(MSE / SSIM / blended)."""
+
+from dataclasses import dataclass, fields, is_dataclass, replace
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+@dataclass
+class PredictorHidden:
+    """Recurrent state threaded through NextFramePredictor.forward, one
+    call to the next. None (the dataclass default for every field) on a
+    fresh model / right after a reset. Every field must round-trip through
+    detach_hidden -- see its dataclass branch below, which recurses generically
+    without needing to know this shape."""
+    st_lstm: "STLSTMHiddenState | None" = None  # HierarchicalSTLSTM's hidden state (hc list + shared m)
+    prev_frame: "torch.Tensor | None" = None  # previous call's raw input (for flow estimation)
+    prev_flow: "torch.Tensor | None" = None   # previous step's flow field (refined, not re-derived, next step)
+    prev_flow_velocity: "torch.Tensor | None" = None  # previous step's flow-velocity estimate (see FlowHead)
+
+
+@dataclass
+class PredictorOutput:
+    """Everything one NextFramePredictor.forward() call produces beyond the
+    updated hidden state, so callers never need to reach into hidden-state
+    internals to get the flow field / latents needed for loss computation."""
+    pred: torch.Tensor
+    hidden: PredictorHidden
+    flow: "torch.Tensor | None"
+    flow_velocity: "torch.Tensor | None" = None
+    bottleneck_latent: "torch.Tensor | None" = None  # post-recurrence bottleneck h; world-model target space
+    warped_base: "torch.Tensor | None" = None        # flow-warped base frame fed to the decoder's residual path
 
 
 def _group_norm(channels: int, max_groups: int = 8) -> nn.GroupNorm:
@@ -85,23 +115,45 @@ class FlowHead(nn.Module):
     reusing DownBlock/UpBlock for consistency with the main Encoder/
     Decoder. The final conv is zero-initialized so a fresh model predicts
     exactly zero flow (identity warp), mirroring the zero-init trick on
-    Decoder.final_up."""
+    Decoder.final_up.
 
-    def __init__(self, in_channels: int = 6, hidden_channels: int = 16):
+    With `use_acceleration`, also predicts a second 2-channel field:
+    flow VELOCITY, i.e. the rate of change of the flow field itself
+    (conditioned on its own previous estimate, same refine-not-re-derive
+    principle as flow), so the caller can warp using flow+velocity
+    (constant-acceleration extrapolation) instead of just flow
+    (constant-velocity extrapolation) -- lets fast-changing motion
+    (accelerating/decelerating/turning) be tracked instead of always
+    assuming the last-observed displacement continues unchanged. Also
+    zero-initialized, so `use_acceleration=True` is architecturally
+    additive at construction: a fresh model still predicts exactly zero
+    flow and zero velocity."""
+
+    def __init__(self, in_channels: int = 6, hidden_channels: int = 16,
+                 use_acceleration: bool = True):
         super().__init__()
-        self.in_conv = nn.Conv2d(in_channels + 2, hidden_channels, 3, padding=1)
+        self.use_acceleration = use_acceleration
+        cond_channels = 4 if use_acceleration else 2  # prev_flow[, prev_velocity]
+        out_channels = 4 if use_acceleration else 2  # flow[, velocity]
+        self.in_conv = nn.Conv2d(in_channels + cond_channels, hidden_channels, 3, padding=1)
         self.down = DownBlock(hidden_channels, hidden_channels * 2, num_res_blocks=1)
         self.up = UpBlock(hidden_channels * 2, hidden_channels, hidden_channels, num_res_blocks=1)
-        self.out_conv = nn.Conv2d(hidden_channels, 2, 3, padding=1)
+        self.out_conv = nn.Conv2d(hidden_channels, out_channels, 3, padding=1)
         nn.init.zeros_(self.out_conv.weight)
         nn.init.zeros_(self.out_conv.bias)
 
-    def forward(self, prev_frame, curr_frame, prev_flow):
-        x = self.in_conv(torch.cat([prev_frame, curr_frame, prev_flow], dim=1))
+    def forward(self, prev_frame, curr_frame, prev_flow, prev_velocity=None):
+        parts = [prev_frame, curr_frame, prev_flow]
+        if self.use_acceleration:
+            parts.append(prev_velocity)
+        x = self.in_conv(torch.cat(parts, dim=1))
         skip = x
         x = self.down(x)
         x = self.up(x, skip)
-        return self.out_conv(x)
+        out = self.out_conv(x)
+        if self.use_acceleration:
+            return out[:, :2], out[:, 2:]
+        return out, None
 
 
 def warp_frame(frame: torch.Tensor, flow: torch.Tensor) -> torch.Tensor:
@@ -134,96 +186,116 @@ def _resize_flow(flow: torch.Tensor, size: tuple) -> torch.Tensor:
     return resized * scale
 
 
-class ConvLSTMCell(nn.Module):
-    """A single ConvLSTM step: same recurrence as a normal LSTM, but every
-    gate is a convolution instead of a matmul, so spatial structure survives."""
+@dataclass
+class STLSTMHiddenState:
+    """Hidden state for one HierarchicalSTLSTM. `hc` is list[(h, c)], one
+    pair per cell in zigzag order (finest skip scale ... coarsest skip
+    scale ... bottleneck-depth cells). `m` is the single shared
+    spatiotemporal memory tensor, carried from the last (deepest) cell's
+    output at the end of one timestep to become the first (finest) cell's
+    input at the START of the next timestep -- a persistent cross-scale
+    "memory highway" that today's independent per-scale cells have no
+    equivalent of."""
+    hc: list
+    m: torch.Tensor
 
-    def __init__(self, in_channels: int, hidden_channels: int, kernel_size: int = 3):
+
+class STLSTMCell(nn.Module):
+    """One PredRNN-style spatiotemporal-LSTM cell. Unlike a plain
+    ConvLSTMCell, carries TWO memories: `c` (temporal, persists across TIME
+    for this scale/depth only -- the same role a normal ConvLSTM cell state
+    plays) and `m` (spatiotemporal, flows ACROSS SCALES within a single
+    timestep, seeded from the previous cell's m output in
+    HierarchicalSTLSTM's zigzag order). `h` fuses information from both
+    memories via a 1x1 conv, so downstream consumers (the next cell, or the
+    decoder) see one tensor blending temporal and cross-scale context."""
+
+    def __init__(self, in_channels: int, hidden_channels: int, m_channels: int, kernel_size: int = 3):
         super().__init__()
         self.hidden_channels = hidden_channels
+        self.m_channels = m_channels
         padding = kernel_size // 2
-        self.conv = nn.Conv2d(
-            in_channels + hidden_channels, 4 * hidden_channels, kernel_size, padding=padding
+        self.conv_temporal = nn.Conv2d(
+            in_channels + hidden_channels, 3 * hidden_channels, kernel_size, padding=padding
         )
+        self.conv_st = nn.Conv2d(in_channels + m_channels, 3 * m_channels, kernel_size, padding=padding)
+        self.conv_o = nn.Conv2d(
+            in_channels + hidden_channels * 2 + m_channels, hidden_channels, kernel_size, padding=padding
+        )
+        self.fuse = nn.Conv2d(hidden_channels + m_channels, hidden_channels, 1)
 
-    def forward(self, x, hidden):
-        h_prev, c_prev = hidden
-        gates = self.conv(torch.cat([x, h_prev], dim=1))
-        i, f, o, g = torch.chunk(gates, 4, dim=1)
-        i, f, o = torch.sigmoid(i), torch.sigmoid(f), torch.sigmoid(o)
-        g = torch.tanh(g)
-        c = f * c_prev + i * g
-        h = o * torch.tanh(c)
-        return h, c
+    def forward(self, x, h_prev, c_prev, m_in):
+        i, f, g = torch.chunk(self.conv_temporal(torch.cat([x, h_prev], dim=1)), 3, dim=1)
+        c = torch.sigmoid(f) * c_prev + torch.sigmoid(i) * torch.tanh(g)
+
+        i2, f2, g2 = torch.chunk(self.conv_st(torch.cat([x, m_in], dim=1)), 3, dim=1)
+        m = torch.sigmoid(f2) * m_in + torch.sigmoid(i2) * torch.tanh(g2)
+
+        o = torch.sigmoid(self.conv_o(torch.cat([x, h_prev, c, m], dim=1)))
+        h = o * torch.tanh(self.fuse(torch.cat([c, m], dim=1)))
+        return h, c, m
 
     def init_hidden(self, batch_size, height, width, device):
         shape = (batch_size, self.hidden_channels, height, width)
         return torch.zeros(shape, device=device), torch.zeros(shape, device=device)
 
-
-class ConvLSTMStack(nn.Module):
-    """Stacked multi-layer ConvLSTM. Layer i's hidden output feeds layer
-    i+1's input (standard stacked-RNN convention), giving deeper/
-    hierarchical temporal reasoning than a single cell. Hidden state for
-    the whole stack is a list[(h, c)], one tuple per layer."""
-
-    def __init__(self, in_channels: int, hidden_channels: list, kernel_size: int = 3):
-        super().__init__()
-        self.hidden_channels = list(hidden_channels)
-        self.out_channels = self.hidden_channels[-1]
-        cells, prev_channels = [], in_channels
-        for hc in self.hidden_channels:
-            cells.append(ConvLSTMCell(prev_channels, hc, kernel_size))
-            prev_channels = hc
-        self.cells = nn.ModuleList(cells)
-
-    def forward(self, x, hidden):
-        if hidden is None:
-            hidden = self.init_hidden(x.shape[0], x.shape[2], x.shape[3], x.device)
-        new_hidden, layer_input = [], x
-        for cell, h in zip(self.cells, hidden):
-            h_new, c_new = cell(layer_input, h)
-            new_hidden.append((h_new, c_new))
-            layer_input = h_new
-        return layer_input, new_hidden
-
-    def init_hidden(self, batch_size, height, width, device):
-        return [cell.init_hidden(batch_size, height, width, device) for cell in self.cells]
+    def init_m(self, batch_size, height, width, device):
+        return torch.zeros(batch_size, self.m_channels, height, width, device=device)
 
 
-class SkipConvLSTMBank(nn.Module):
-    """One independent ConvLSTMCell per encoder skip scale -- a parallel
-    bank, not a sequential stack like ConvLSTMStack (skip scales have no
-    layer-feeds-layer relationship to each other, unlike stacked-RNN
-    depth). Without this, every skip connection is purely feedforward (or
-    flow-warped) with zero learned memory of its own, and all temporal
-    memory lives at the single coarsest bottleneck scale -- the main cap
-    on tracking fast/fine motion. Each cell gets its own private hidden
-    state, threaded alongside the bottleneck stack's in the model's
-    overall hidden tuple."""
+class HierarchicalSTLSTM(nn.Module):
+    """One STLSTMCell per encoder scale (finest skip scale first, then
+    progressively coarser skip scales, then `lstm_layers` bottleneck-depth
+    cells), unifying what used to be two separate, non-interacting
+    mechanisms (an independent-per-scale ConvLSTM bank for skip
+    connections, plus a wholly separate stacked ConvLSTM at the bottleneck)
+    into one hierarchy with genuine cross-scale information flow: the
+    spatiotemporal memory `m` zigzags finest -> coarsest within a single
+    timestep (each cell's m output seeds the next cell's m input), and the
+    final (deepest) cell's m becomes next timestep's seed for the finest
+    cell -- the main structural fix for what used to cap fast/fine motion
+    tracking at whatever the single coarsest bottleneck scale could
+    represent.
 
-    def __init__(self, in_channels_list: list, hidden_channels_list: list, kernel_size: int = 3):
+    `xs` is a list of per-scale inputs: encoder skip features (shallowest/
+    finest first) followed by the encoder's coarsest `features` -- one
+    entry per RECURRENT INPUT SCALE, not one per cell. Bottleneck-depth
+    cells beyond the first don't have their own scale input; like a
+    standard stacked RNN, they take the previous cell's `h` as input
+    instead (`layer_input` below), matching today's ConvLSTMStack
+    layer-feeds-layer convention."""
+
+    def __init__(self, in_channels_list: list, hidden_channels_list: list,
+                 m_channels: int = 32, kernel_size: int = 3):
         super().__init__()
         self.cells = nn.ModuleList([
-            ConvLSTMCell(c_in, c_hidden, kernel_size)
+            STLSTMCell(c_in, c_hidden, m_channels, kernel_size)
             for c_in, c_hidden in zip(in_channels_list, hidden_channels_list)
         ])
+        self.m_channels = m_channels
+        self.out_channels = hidden_channels_list[-1]
 
-    def forward(self, xs: list, hiddens):
-        if hiddens is None:
-            hiddens = self.init_hidden(xs)
-        new_hiddens, outs = [], []
-        for cell, x, h in zip(self.cells, xs, hiddens):
-            h_new, c_new = cell(x, h)
-            new_hiddens.append((h_new, c_new))
-            outs.append(h_new)
-        return outs, new_hiddens
+    def forward(self, xs: list, hidden: "STLSTMHiddenState | None"):
+        if hidden is None:
+            hc = [
+                cell.init_hidden(xs[min(i, len(xs) - 1)].shape[0], xs[min(i, len(xs) - 1)].shape[2],
+                                  xs[min(i, len(xs) - 1)].shape[3], xs[min(i, len(xs) - 1)].device)
+                for i, cell in enumerate(self.cells)
+            ]
+            m = self.cells[0].init_m(xs[0].shape[0], xs[0].shape[2], xs[0].shape[3], xs[0].device)
+        else:
+            hc, m = hidden.hc, hidden.m
 
-    def init_hidden(self, xs: list):
-        return [
-            cell.init_hidden(x.shape[0], x.shape[2], x.shape[3], x.device)
-            for cell, x in zip(self.cells, xs)
-        ]
+        new_hc, outs, layer_input = [], [], None
+        for idx, (cell, (h_prev, c_prev)) in enumerate(zip(self.cells, hc)):
+            x = xs[idx] if idx < len(xs) else layer_input
+            if m.shape[-2:] != x.shape[-2:]:
+                m = F.interpolate(m, size=x.shape[-2:], mode="bilinear", align_corners=True)
+            h, c, m = cell(x, h_prev, c_prev, m)
+            new_hc.append((h, c))
+            outs.append(h)
+            layer_input = h
+        return outs, STLSTMHiddenState(hc=new_hc, m=m)
 
 
 class Encoder(nn.Module):
@@ -321,57 +393,97 @@ class Decoder(nn.Module):
 
 
 class NextFramePredictor(nn.Module):
-    """(flow-warp) -> encoder -> stacked ConvLSTM (+ per-skip-scale
-    ConvLSTM bank) -> decoder. Carries recurrent state across calls so
-    predictions are conditioned on motion history, not a single frame,
-    now at multiple resolutions rather than only the coarsest bottleneck.
-    `hidden` is None or (bottleneck_hidden, skip_hiddens, prev_frame,
-    prev_flow): bottleneck_hidden is list[(h, c)] (one tuple per
-    ConvLSTM layer), skip_hiddens is list[(h, c)] (one tuple per encoder
-    skip scale, or None entries if skip recurrence is disabled),
-    prev_frame is the raw input tensor from the previous call (used to
-    compute optical flow to the current frame), prev_flow is the
-    previous step's flow field (used to refine, not re-derive, the next
-    flow estimate)."""
+    """(flow-warp) -> encoder -> HierarchicalSTLSTM (spanning both skip
+    scales and bottleneck depth) -> decoder. Carries recurrent state
+    across calls so predictions are conditioned on motion history, not a
+    single frame, at multiple resolutions with genuine cross-scale
+    information flow within a step (not just independent per-scale
+    memory). `hidden` is a `PredictorHidden` (or None on a fresh model /
+    after reset); `forward` returns a `PredictorOutput`, not a raw tuple,
+    since the set of things callers need out of a step (prediction,
+    updated hidden state, flow field, bottleneck latent) has grown past
+    what a positional tuple can carry safely."""
 
     def __init__(self, in_channels: int = 3, encoder_base_channels: int = 32,
                  encoder_scales: int = 3, res_blocks_per_scale: int = 1,
                  lstm_hidden_channels: int = 128, lstm_layers: int = 2,
                  kernel_size: int = 3, delta_scale: float = 0.6,
                  use_flow: bool = True, flow_hidden_channels: int = 16,
-                 use_blend_mask: bool = True, skip_lstm_base_channels: int = 16):
+                 use_blend_mask: bool = True, skip_lstm_base_channels: int = 16,
+                 use_flow_acceleration: bool = True, st_memory_channels: int = 32,
+                 world_model_hidden_channels: int = 64):
         super().__init__()
         self.use_flow = use_flow
+        self.use_flow_acceleration = use_flow_acceleration and use_flow
         if use_flow:
-            self.flow_head = FlowHead(in_channels * 2, flow_hidden_channels)
-        encoder_in_channels = in_channels + 2 if use_flow else in_channels
+            self.flow_head = FlowHead(
+                in_channels * 2, flow_hidden_channels, use_acceleration=self.use_flow_acceleration
+            )
+        # +2 channels for flow, +2 more for velocity when acceleration is enabled.
+        # Stashed on self so encode_frame() (a standalone, history-free encoder
+        # pass used by the world-model loss's target embedding) can zero-pad
+        # the same channel count without duplicating this computation.
+        self.flow_channels = (4 if self.use_flow_acceleration else 2) if use_flow else 0
+        encoder_in_channels = in_channels + self.flow_channels
         self.encoder = Encoder(
             encoder_in_channels, encoder_base_channels, encoder_scales, res_blocks_per_scale
         )
-        self.lstm = ConvLSTMStack(
-            self.encoder.out_channels, [lstm_hidden_channels] * lstm_layers, kernel_size
-        )
         self.use_skip_recurrence = skip_lstm_base_channels > 0 and len(self.encoder.skip_channels) > 0
+        # Bottleneck-depth cells beyond the first take the previous cell's
+        # h as input (stacked-RNN convention), so only the first bottleneck
+        # cell needs an explicit input-channel entry for `features`.
+        bottleneck_in = [self.encoder.out_channels] + [lstm_hidden_channels] * (lstm_layers - 1)
+        bottleneck_hidden_channels = [lstm_hidden_channels] * lstm_layers
         if self.use_skip_recurrence:
             skip_lstm_hidden = [
                 skip_lstm_base_channels * (2 ** i) for i in range(len(self.encoder.skip_channels))
             ]
-            self.skip_lstm = SkipConvLSTMBank(
-                self.encoder.skip_channels, skip_lstm_hidden, kernel_size
-            )
+            in_channels_list = list(self.encoder.skip_channels) + bottleneck_in
+            hidden_channels_list = skip_lstm_hidden + bottleneck_hidden_channels
             decoder_skip_channels = skip_lstm_hidden
         else:
+            in_channels_list = bottleneck_in
+            hidden_channels_list = bottleneck_hidden_channels
             decoder_skip_channels = self.encoder.skip_channels
+        self.st_lstm = HierarchicalSTLSTM(in_channels_list, hidden_channels_list, st_memory_channels, kernel_size)
         self.decoder = Decoder(
-            self.lstm.out_channels, decoder_skip_channels, encoder_base_channels,
+            self.st_lstm.out_channels, decoder_skip_channels, encoder_base_channels,
             in_channels, delta_scale, res_blocks_per_scale, use_blend_mask
         )
+        # Cooperates with the generator (unlike the adversarial Discriminator,
+        # which deliberately lives outside this module) -- rides in the same
+        # optimizer as everything else. Not called from forward(); invoked
+        # explicitly by training.py's world-model loss wiring, like the other
+        # auxiliary losses.
+        self.world_model_head = WorldModelHead(
+            self.st_lstm.out_channels, self.encoder.out_channels, world_model_hidden_channels, kernel_size
+        )
+
+    def encode_frame(self, frame):
+        """Stateless, history-free encoder-only forward pass on a standalone
+        frame -- used to compute the world-model loss's target embedding
+        from a real future frame sitting in the replay buffer, with no
+        recurrent state or flow-warp involved. Zero-pads the same flow/
+        velocity channel slots the encoder normally receives (there's no
+        motion history for a lone frame processed this way), so channel
+        counts match regardless of --use-flow/--flow-acceleration."""
+        if self.flow_channels:
+            pad = torch.zeros(
+                frame.shape[0], self.flow_channels, frame.shape[2], frame.shape[3],
+                device=frame.device, dtype=frame.dtype,
+            )
+            encoder_in = torch.cat([frame, pad], dim=1)
+        else:
+            encoder_in = frame
+        features, _ = self.encoder(encoder_in)
+        return features
 
     def forward(self, x, hidden):
         if hidden is None:
-            bottleneck_hidden, skip_hiddens, prev_frame, prev_flow = None, None, None, None
-        else:
-            bottleneck_hidden, skip_hiddens, prev_frame, prev_flow = hidden
+            hidden = PredictorHidden()
+        prev_frame = hidden.prev_frame
+        prev_flow = hidden.prev_flow
+        prev_velocity = hidden.prev_flow_velocity
 
         if self.use_flow:
             if prev_frame is not None:
@@ -379,39 +491,61 @@ class NextFramePredictor(nn.Module):
                     prev_flow = torch.zeros(
                         x.shape[0], 2, x.shape[2], x.shape[3], device=x.device, dtype=x.dtype
                     )
-                flow = self.flow_head(prev_frame, x, prev_flow)
-                warped = warp_frame(x, flow)
+                if self.use_flow_acceleration and prev_velocity is None:
+                    prev_velocity = torch.zeros_like(prev_flow)
+                flow, velocity = self.flow_head(prev_frame, x, prev_flow, prev_velocity)
+                # Constant-acceleration extrapolation (flow+velocity) when
+                # enabled, else today's constant-velocity extrapolation
+                # (flow alone). This extrapolated field is ephemeral -- used
+                # only to warp the base frame/skips below, never stored in
+                # hidden state (the raw flow/velocity pair is what persists).
+                flow_extrap = flow + velocity if self.use_flow_acceleration else flow
+                warped = warp_frame(x, flow_extrap)
             else:
                 flow = torch.zeros(x.shape[0], 2, x.shape[2], x.shape[3], device=x.device, dtype=x.dtype)
+                velocity = flow.clone() if self.use_flow_acceleration else None
+                flow_extrap = flow
                 warped = x
-            encoder_in = torch.cat([x, flow], dim=1)
+            encoder_in = torch.cat([x, flow, velocity], dim=1) if self.use_flow_acceleration else torch.cat([x, flow], dim=1)
         else:
-            flow = None
+            flow, velocity, flow_extrap = None, None, None
             warped, encoder_in = x, x
 
         features, skips = self.encoder(encoder_in)
 
+        # Recurrence runs on the raw, unwarped encoder outputs, so the
+        # stored hidden state (both `hc` and the shared `m`) always lives
+        # in one stable coordinate frame -- warping is applied only to the
+        # ephemeral per-step output below (discarded after the decoder
+        # consumes it), never fed back in as next step's input. Feeding
+        # warped output back in would re-resample an already-resampled
+        # tensor every step, compounding bilinear blur over a long-running
+        # session.
         if self.use_skip_recurrence:
-            # Recurrence runs on the raw, unwarped skip activations, so the
-            # stored hidden state always lives in one stable coordinate
-            # frame -- warping is applied only to the ephemeral per-step
-            # output below (discarded after the decoder consumes it), never
-            # fed back in as next step's input. Feeding warped output back
-            # in would re-resample an already-resampled tensor every step,
-            # compounding bilinear blur over a long-running session.
-            skips, skip_hiddens = self.skip_lstm(skips, skip_hiddens)
+            xs = list(skips) + [features]
+            outs, st_hidden = self.st_lstm(xs, hidden.st_lstm)
+            n_skip = len(skips)
+            skip_outs, bottleneck_latent = outs[:n_skip], outs[-1]
+        else:
+            outs, st_hidden = self.st_lstm([features], hidden.st_lstm)
+            skip_outs, bottleneck_latent = skips, outs[-1]
 
         if self.use_flow and prev_frame is not None:
             # Skip features were captured from the current (unwarped) frame,
             # but base_frame is now motion-extrapolated -- warp the skips by
-            # the same flow (rescaled per-scale) so the detail they add is
-            # spatially consistent with the predicted-frame geometry instead
-            # of ghosting at moving edges.
-            skips = [warp_frame(skip, _resize_flow(flow, skip.shape[2:])) for skip in skips]
+            # the same extrapolated field (rescaled per-scale) so the detail
+            # they add is spatially consistent with the predicted-frame
+            # geometry instead of ghosting at moving edges.
+            skip_outs = [warp_frame(s, _resize_flow(flow_extrap, s.shape[2:])) for s in skip_outs]
 
-        top_h, bottleneck_hidden = self.lstm(features, bottleneck_hidden)
-        pred = self.decoder(top_h, skips, warped)
-        return pred, (bottleneck_hidden, skip_hiddens, x, flow), flow
+        pred = self.decoder(bottleneck_latent, skip_outs, warped)
+        new_hidden = PredictorHidden(
+            st_lstm=st_hidden, prev_frame=x, prev_flow=flow, prev_flow_velocity=velocity,
+        )
+        return PredictorOutput(
+            pred=pred, hidden=new_hidden, flow=flow, flow_velocity=velocity,
+            bottleneck_latent=bottleneck_latent, warped_base=warped,
+        )
 
 
 def detach_hidden(hidden):
@@ -427,6 +561,8 @@ def detach_hidden(hidden):
         return tuple(detach_hidden(h) for h in hidden)
     if isinstance(hidden, list):
         return [detach_hidden(h) for h in hidden]
+    if is_dataclass(hidden):
+        return replace(hidden, **{f.name: detach_hidden(getattr(hidden, f.name)) for f in fields(hidden)})
     raise TypeError(f"Unexpected hidden-state element: {type(hidden)!r}")
 
 
@@ -486,6 +622,100 @@ def motion_delta_loss(pred: torch.Tensor, target: torch.Tensor,
     pred_delta = (pred - prev_frame).abs()
     real_delta = (target - prev_frame).abs()
     return F.mse_loss(pred_delta, real_delta)
+
+
+class WorldModelHead(nn.Module):
+    """Asymmetric predictor mapping the recurrent core's current bottleneck
+    latent to a predicted FUTURE latent in a distinct representation
+    space -- the encoder's own (feedforward, no recurrence) embedding of
+    a real future frame. Conditioned on the current flow/velocity as a
+    motion cue for how far content will have moved by the target horizon.
+    Deliberately a separate small network from the encoder/ST-LSTM whose
+    output it's trained to match, rather than comparing raw bottleneck
+    space to itself -- one of this loss's collapse-resistance measures
+    (see world_model_consistency_loss and TrainingEngine's usage)."""
+
+    def __init__(self, bottleneck_channels: int, target_channels: int,
+                 hidden_channels: int = 64, kernel_size: int = 3):
+        super().__init__()
+        padding = kernel_size // 2
+        self.conv1 = nn.Conv2d(bottleneck_channels + 4, hidden_channels, kernel_size, padding=padding)
+        self.norm1 = _group_norm(hidden_channels)
+        self.conv2 = nn.Conv2d(hidden_channels, hidden_channels, kernel_size, padding=padding)
+        self.norm2 = _group_norm(hidden_channels)
+        self.out = nn.Conv2d(hidden_channels, target_channels, 1)
+
+    def forward(self, bottleneck_latent, flow, velocity):
+        b, _, h, w = bottleneck_latent.shape
+        if flow is not None:
+            flow_ds = _resize_flow(flow, (h, w))
+        else:
+            flow_ds = torch.zeros(b, 2, h, w, device=bottleneck_latent.device, dtype=bottleneck_latent.dtype)
+        vel_ds = _resize_flow(velocity, (h, w)) if velocity is not None else torch.zeros_like(flow_ds)
+        x = F.relu(self.norm1(self.conv1(torch.cat([bottleneck_latent, flow_ds, vel_ds], dim=1))))
+        x = F.relu(self.norm2(self.conv2(x)))
+        return self.out(x)
+
+
+def world_model_consistency_loss(pred_latent: torch.Tensor, target_latent: torch.Tensor) -> torch.Tensor:
+    """Cosine-similarity latent-consistency loss -- deliberately NOT raw
+    MSE: MSE against a detached target can be cheaply "solved" by
+    shrinking overall activation magnitude toward zero rather than
+    learning real predictive structure, whereas a normalized (cosine)
+    comparison removes that shortcut. One of several collapse-resistance
+    measures for this loss, alongside the stop-gradient target (see
+    TrainingEngine's peek/encode_frame usage, always under no_grad) and
+    WorldModelHead's architectural asymmetry from its own input space."""
+    pred_n = F.normalize(pred_latent, dim=1)
+    target_n = F.normalize(target_latent, dim=1)
+    return (1.0 - (pred_n * target_n).sum(dim=1)).mean()
+
+
+class Discriminator(nn.Module):
+    """PatchGAN-style discriminator for the adversarial loss: a spectral-
+    normalized (not GroupNorm/BatchNorm -- spectral norm needs no batch
+    statistics at all, sidestepping the batch-size-1 online-training
+    problem entirely, unlike GroupNorm which would be an awkward, purely
+    approximate fit here) stride-2 conv stack producing a SPATIAL map of
+    real/fake logits rather than one scalar per frame, so gradient
+    concentrates on which regions look fake (typically the blur-prone
+    regions this whole feature targets) instead of an undifferentiated
+    whole-frame verdict. Lives outside NextFramePredictor (constructed and
+    optimized separately by TrainingEngine) and is trained from scratch,
+    like everything else in this project -- no pretrained weights."""
+
+    def __init__(self, in_channels: int = 3, base_channels: int = 32, num_layers: int = 3):
+        super().__init__()
+        layers, c_in = [], in_channels
+        for i in range(num_layers):
+            c_out = base_channels * (2 ** i)
+            layers += [
+                nn.utils.parametrizations.spectral_norm(nn.Conv2d(c_in, c_out, 4, stride=2, padding=1)),
+                nn.LeakyReLU(0.2, inplace=True),
+            ]
+            c_in = c_out
+        self.features = nn.Sequential(*layers)
+        self.out_conv = nn.utils.parametrizations.spectral_norm(nn.Conv2d(c_in, 1, 3, padding=1))
+
+    def forward(self, frame):
+        return self.out_conv(self.features(frame))  # (B, 1, h', w') patch logits
+
+
+def lsgan_d_loss(real_logits: torch.Tensor, fake_logits: torch.Tensor) -> torch.Tensor:
+    """LSGAN (least-squares GAN) discriminator loss -- quadratic, not the
+    vanilla BCE-GAN log-loss, specifically to avoid the classic cold-start
+    problem: BCE's log(1 - D(fake)) saturates hard once D confidently
+    rejects an early, still-noisy predictor, giving near-zero generator
+    gradient exactly when it's needed most. LSGAN keeps penalizing
+    "confidently wrong" logits proportionally instead."""
+    return 0.5 * (F.mse_loss(real_logits, torch.ones_like(real_logits))
+                  + F.mse_loss(fake_logits, torch.zeros_like(fake_logits)))
+
+
+def lsgan_g_loss(fake_logits: torch.Tensor) -> torch.Tensor:
+    """LSGAN generator loss: push the discriminator's verdict on the
+    generator's own output toward "real" (see lsgan_d_loss)."""
+    return F.mse_loss(fake_logits, torch.ones_like(fake_logits))
 
 
 class WeightedMSELoss(nn.Module):

@@ -93,36 +93,52 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--lstm-layers",
         type=int,
         default=2,
-        help="Number of stacked ConvLSTM layers forming the recurrent temporal "
-        "core (default: 2)",
+        help="Number of bottleneck-depth spatiotemporal-LSTM cells stacked after "
+        "the (optional) skip-scale cells in the hierarchical ST-LSTM core "
+        "(default: 2) -- the cross-scale memory `m` zigzags through these last, "
+        "after every skip scale.",
     )
     p.add_argument(
         "--lstm-hidden-channels",
         type=int,
         default=128,
-        help="Hidden/cell channel count of each ConvLSTM layer, uniform across "
-        "all layers (default: 128)",
+        help="Hidden/cell channel count of each bottleneck-depth ST-LSTM cell, "
+        "uniform across all such cells (default: 128).",
     )
     p.add_argument(
         "--lstm-kernel-size",
         type=int,
         default=3,
-        help="Convolution kernel size for every ConvLSTM gate (bottleneck stack "
-        "and, if enabled, per-scale skip cells) (default: 3). Larger kernels "
-        "widen each cell's per-step receptive field at extra compute cost.",
+        help="Convolution kernel size for every ST-LSTM gate (bottleneck-depth "
+        "cells and, if enabled, per-scale skip cells alike) (default: 3). Larger "
+        "kernels widen each cell's per-step receptive field at extra compute cost.",
+    )
+    p.add_argument(
+        "--st-memory-channels",
+        type=int,
+        default=32,
+        help="Channel count of the spatiotemporal memory `m` shared across every "
+        "scale of the hierarchical ST-LSTM core (default: 32), distinct from each "
+        "scale's own hidden/cell channels (--skip-lstm-base-channels / "
+        "--lstm-hidden-channels). This is the tensor that gives the recurrent "
+        "core genuine cross-scale information flow within a single timestep -- "
+        "it zigzags from the finest skip scale down to the bottleneck within one "
+        "step, and the bottleneck's final value seeds the finest scale's `m` at "
+        "the start of the next step.",
     )
     p.add_argument(
         "--skip-lstm-base-channels",
         type=int,
         default=16,
         help="Hidden channel count of the first (highest-resolution) per-scale "
-        "ConvLSTM cell attached to each encoder skip connection, doubling per "
-        "scale like the encoder's own channel progression (default: 16). Today "
-        "skip connections are purely feedforward with no temporal memory of "
-        "their own; this gives each scale its own recurrent state so fast/fine "
-        "motion detail isn't limited to whatever the single coarsest bottleneck "
-        "scale can represent. Set to 0 to disable (today's feedforward-only "
-        "skip behavior).",
+        "ST-LSTM cell attached to each encoder skip connection, doubling per "
+        "scale like the encoder's own channel progression (default: 16). Gives "
+        "each scale its own recurrent state (and a place in the cross-scale `m` "
+        "zigzag, see --st-memory-channels) so fast/fine motion detail isn't "
+        "limited to whatever the single coarsest bottleneck scale can represent. "
+        "Set to 0 to disable (feedforward-only skips; the ST-LSTM core then runs "
+        "at the bottleneck depth only -- still gains the `m` pathway there "
+        "versus a plain stacked ConvLSTM, just without the cross-scale reach).",
     )
     p.add_argument(
         "--delta-scale",
@@ -158,6 +174,115 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "photometric loss -- keep this small) (default: 0.01). Too large a value "
         "can collapse flow back toward the zero-init trivial solution. Set to 0 "
         "to disable. Ignored when --use-flow off.",
+    )
+    p.add_argument(
+        "--flow-acceleration",
+        choices=["on", "off"],
+        default="on",
+        help="Extend FlowHead to also predict flow VELOCITY (the rate of change of "
+        "the flow field itself) and warp using flow+velocity (constant-acceleration "
+        "extrapolation) instead of just flow (constant-velocity extrapolation) "
+        "(default: on). Zero-initialized like the rest of FlowHead, so this is "
+        "architecturally additive at construction -- a fresh model still predicts "
+        "exactly zero flow and zero velocity. Set to off to fall back to today's "
+        "constant-velocity-only behavior. Ignored when --use-flow off.",
+    )
+    p.add_argument(
+        "--flow-accel-smoothness-weight",
+        type=float,
+        default=0.01,
+        help="Edge-aware total-variation regularization weight on the predicted "
+        "flow-VELOCITY field, analogous to --flow-smoothness-weight but for the "
+        "acceleration term (default: 0.01). Velocity is, like flow, supervised "
+        "only indirectly through the downstream warp -- without this it can "
+        "drift noisily in textureless/occluded regions. Set to 0 to disable. "
+        "Ignored unless --flow-acceleration on.",
+    )
+    p.add_argument(
+        "--world-model-weight",
+        type=float,
+        default=0.1,
+        help="Weight for an auxiliary latent-space consistency loss: a small "
+        "predictor head maps the recurrent core's current bottleneck latent to "
+        "a predicted future latent, compared (cosine distance) against the real "
+        "encoder features of a genuine future frame, --world-model-horizon "
+        "frames ahead (default: 0.1). Makes the internal representation more "
+        "predictive of actual future content, not just good for one-step pixel "
+        "reconstruction. Set to 0 to disable. NOTE: only active while the real-"
+        "frame delay (--real-frame-interval-frames / the live delay slider) is "
+        ">= --world-model-horizon, since the lookahead frame is sourced by "
+        "peeking the existing replay buffer rather than a new buffering "
+        "mechanism -- inactive (a logged no-op) at the default delay of 0.",
+    )
+    p.add_argument(
+        "--world-model-horizon",
+        type=int,
+        default=4,
+        help="How many frames ahead (peeked from the replay buffer) the world-"
+        "model predictor head targets (default: 4). Larger values make the "
+        "objective harder (less correlated with the present) but push the "
+        "representation to encode longer-range predictive structure; must be "
+        "<= --real-frame-interval-max-frames for the feature to ever be "
+        "reachable via the delay slider.",
+    )
+    p.add_argument(
+        "--world-model-hidden-channels",
+        type=int,
+        default=64,
+        help="Hidden channel count of the world-model predictor head's internal "
+        "conv layers (default: 64). Deliberately a separate small network from "
+        "the encoder/ST-LSTM whose output it's trained to match (an asymmetric "
+        "predictor head), which is itself part of this loss's defense against "
+        "representation collapse.",
+    )
+    p.add_argument(
+        "--adv-weight",
+        type=float,
+        default=0.05,
+        help="Weight for the generator's adversarial (LSGAN) loss term against a "
+        "discriminator trained alongside it from scratch, encouraging sharper/"
+        "less-blurry predictions than photometric loss alone rewards (default: "
+        "0.05 -- kept small since this optimizes realism/sharpness, not exact "
+        "pixel correctness; too high can let the generator hallucinate detail "
+        "unfaithful to actual content). Ramped up from 0 over --adv-warmup-steps. "
+        "Set to 0 to disable (the discriminator still trains, just has no effect "
+        "on the generator).",
+    )
+    p.add_argument(
+        "--adv-warmup-steps",
+        type=int,
+        default=500,
+        help="Training steps to linearly ramp the adversarial loss weight from 0 "
+        "up to --adv-weight, restarted on every reset (default: 500). Mitigates "
+        "the classic GAN cold-start problem: an untrained predictor's early "
+        "noisy output gives the discriminator a trivial win with near-zero "
+        "useful gradient back to the generator -- this keeps the generator "
+        "immune to that while the discriminator has time to become a genuinely "
+        "useful critic. Set to 0 to apply --adv-weight at full strength immediately.",
+    )
+    p.add_argument(
+        "--disc-lr",
+        type=float,
+        default=1e-4,
+        help="Discriminator's own optimizer learning rate, independent of the "
+        "predictor's --lr (default: 1e-4). Balancing generator/discriminator "
+        "learning speed is its own tuning axis distinct from the predictor's.",
+    )
+    p.add_argument(
+        "--disc-base-channels",
+        type=int,
+        default=32,
+        help="Discriminator's first-stage channel count, doubling per stride-2 "
+        "stage like --encoder-base-channels (default: 32).",
+    )
+    p.add_argument(
+        "--disc-layers",
+        type=int,
+        default=3,
+        help="Number of stride-2 conv stages in the discriminator's PatchGAN "
+        "stack (default: 3). Produces a spatial map of real/fake verdicts "
+        "rather than one per frame, so gradient concentrates on which regions "
+        "look fake instead of an undifferentiated whole-frame judgment.",
     )
     p.add_argument(
         "--blend-mask",
