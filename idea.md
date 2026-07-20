@@ -42,7 +42,7 @@ Build a Python application that trains a neural network **online, in real time**
 - Real-frame delay in frames (default 0 = every frame is real, i.e. the original 1:1 behavior), adjustable live via a browser slider that snaps to whole-frame detents and shows the current frame-delay value.
 
 ## Non-goals (explicitly out of scope, don't build)
-- General-purpose long-horizon rollout as a standalone feature (e.g. an API to query "predict N frames ahead" on demand) — the only rollout is the cosmetic display preview described above, which never feeds back into training
+- General-purpose long-horizon rollout as a standalone feature (e.g. an API to query "predict N frames ahead" on demand) — rollout here is limited to the cosmetic display preview described above (never feeds back into training) plus, as of v7 (see CLAUDE.md), a bounded --rollout-horizon-step self-conditioned rollout used only as an additive auxiliary TRAINING loss, gated off below that many frames of real-frame delay and sourcing its targets by peeking (never popping) the replay buffer, same discipline as the world-model loss
 - Saving/loading model checkpoints
 - Any dataset collection, disk-backed persistence, or offline pretraining from sources other than the live camera. The replay buffer is a small, bounded, in-memory FIFO queue only (sized by the real-frame-interval slider) — it is a latency/scheduling mechanism, not a dataset: it doesn't persist across restarts, isn't shuffled/sampled from, and every frame is consumed in strict arrival order exactly once
 - Additional auxiliary input modalities beyond the in-scope learned optical-flow head (e.g. depth, segmentation, audio) — optical flow itself is in-scope, see Model architecture

@@ -79,20 +79,39 @@ def make_optimizer_and_scheduler(name, params, lr, warmup_steps, warmup_start_fa
     return optimizer, scheduler
 
 
+def compute_rollout_loss(model, loss_fn, seed_pred, seed_hidden, targets, decay=1.0):
+    """True-BPTT rollout-consistency loss: self-feeds `seed_pred` through
+    `len(targets)` more forward calls, gradient flowing across the whole
+    chain (no detach between steps) -- this is what lets the loss teach the
+    model to correct for its own compounding prediction errors, not just
+    produce a good single next frame from a real input."""
+    hidden = seed_hidden
+    inp = seed_pred
+    total = 0.0
+    for i, target in enumerate(targets):
+        output = model(inp, hidden)
+        total = total + (decay ** i) * loss_fn(output.pred, target)
+        hidden, inp = output.hidden, output.pred.clamp(0, 1)
+    return total
+
+
 def compute_training_loss(loss_fn, pred, target, prev_frame, flow, flow_velocity,
                            bottleneck_latent, world_model_target, world_model_head,
-                           discriminator, adv_weight_eff, args):
+                           discriminator, adv_weight_eff, rollout_loss, args):
     """Composes the swappable base photometric loss with the optional
     additive auxiliary terms (flow smoothness, flow-acceleration
     smoothness, motion-delta magnitude, world-model latent consistency,
-    adversarial), shared by both the delay=0 and buffered training
-    branches.
+    adversarial, rollout consistency), shared by both the delay=0 and
+    buffered training branches.
 
     `bottleneck_latent`/`world_model_target` are one tick STALE relative to
     `pred`/`target` here -- both come from the SAME earlier forward call
     that produced `pred` (see TrainingEngine._predict_and_learn), so this
     combines into the same single backward() as the pixel loss rather than
-    a second backward() through that already-used graph.
+    a second backward() through that already-used graph. `rollout_loss` is
+    the same kind of one-tick-stale stash, but already a fully-composed
+    scalar (see compute_rollout_loss) with its own un-detached multi-step
+    graph attached -- this backward() is what finally consumes it.
 
     The adversarial term does NOT detach `pred`: gradient must flow from
     the discriminator's verdict back into the generator. Backpropagating
@@ -115,6 +134,8 @@ def compute_training_loss(loss_fn, pred, target, prev_frame, flow, flow_velocity
         loss = loss + args.world_model_weight * world_model_consistency_loss(pred_latent, world_model_target)
     if adv_weight_eff > 0:
         loss = loss + adv_weight_eff * lsgan_g_loss(discriminator(pred))
+    if args.rollout_weight > 0 and rollout_loss is not None:
+        loss = loss + args.rollout_weight * rollout_loss
     return loss
 
 
@@ -175,6 +196,14 @@ class TrainingEngine:
         self.pending_bottleneck_latent = None
         self.pending_world_model_target = None
         self._world_model_active = None  # tri-state so __init__'s first check always logs
+        # Rollout-consistency loss stash: a fully-composed, un-detached
+        # multi-step self-feeding chain built this tick (see
+        # compute_rollout_loss), consumed one tick later in the SAME
+        # backward as the pixel loss -- same one-tick-stale pattern as the
+        # world-model stash above.
+        self.pending_rollout_loss = None
+        self._rollout_step_count = 0  # drives the --rollout-every-n-steps cadence gate
+        self._rollout_active = None  # tri-state so __init__'s first check always logs
         # `display_hidden`/`display_pred` drive the on-screen preview only
         # when buffering is active; periodically reseeded with a real frame
         # and self-fed in between. Purely cosmetic -- no gradient ever flows
@@ -199,6 +228,26 @@ class TrainingEngine:
         self._shutdown = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._log_world_model_status(self._target_lag)
+        self._log_rollout_status(self._target_lag)
+
+    def _log_rollout_status(self, target_lag):
+        """The rollout-consistency loss (see compute_rollout_loss) sources
+        its lookahead targets by peeking the replay buffer, so it's only
+        ever active while the delay slider is >= --rollout-horizon + 1 --
+        including never at the default delay of 0. Log transitions so
+        that contingency is visible rather than a silent no-op."""
+        if self.args.rollout_weight <= 0:
+            return
+        active = target_lag >= self.args.rollout_horizon + 1
+        if active == self._rollout_active:
+            return
+        self._rollout_active = active
+        if active:
+            print(f"[krystalball] rollout-consistency loss active: real-frame delay ({target_lag}) "
+                  f">= --rollout-horizon + 1 ({self.args.rollout_horizon + 1})")
+        else:
+            print(f"[krystalball] rollout-consistency loss inactive: real-frame delay ({target_lag}) "
+                  f"< --rollout-horizon + 1 ({self.args.rollout_horizon + 1})")
 
     def _log_world_model_status(self, target_lag):
         """The world-model loss (see compute_training_loss) sources its
@@ -237,6 +286,7 @@ class TrainingEngine:
         with self._lock:
             self._target_lag = frames
         self._log_world_model_status(frames)
+        self._log_rollout_status(frames)
 
     def _get_target_lag(self):
         with self._lock:
@@ -261,6 +311,8 @@ class TrainingEngine:
         self.prev_train_frame = None
         self.pending_bottleneck_latent = None
         self.pending_world_model_target = None
+        self.pending_rollout_loss = None
+        self._rollout_step_count = 0
         self.display_hidden = None
         self.display_pred = None
         self._buffer.clear()
@@ -279,7 +331,7 @@ class TrainingEngine:
         self._adv_step_count = 0
         self._loss_history.clear()
 
-    def _predict_and_learn(self, ground_truth, world_model_horizon=None):
+    def _predict_and_learn(self, ground_truth, world_model_horizon=None, rollout_horizon=None):
         """One predict-then-learn step against a genuine ground-truth frame
         (either the live frame directly, or one popped off the replay
         buffer) -- shared by both the delay=0 and buffered branches of
@@ -296,7 +348,16 @@ class TrainingEngine:
         (stateless, no_grad) as the world-model loss's target, and stashes
         it alongside this call's bottleneck latent for consumption -- and
         backward() -- one tick later, together with the pixel loss (see
-        compute_training_loss)."""
+        compute_training_loss).
+
+        `rollout_horizon` (K frames), when given and the buffer already
+        holds K+1 frames beyond `ground_truth`, builds a true-BPTT
+        self-feeding rollout (see compute_rollout_loss) seeded from this
+        call's own fresh prediction/hidden state, scored against
+        buffer[1..K] (buffer[0] is skipped -- it's exactly what becomes
+        next call's `ground_truth`, so scoring it here would double-weight
+        the primary loop's own next-step term). Stashed the same one-tick-
+        stale way as the world-model target above."""
         if self.train_pred is not None:
             # Adversarial-weight warmup, mirroring the LR-warmup pattern but
             # as a manually tracked ramp (it scales a loss weight, not an
@@ -314,7 +375,8 @@ class TrainingEngine:
                 self.loss_fn, self.train_pred, ground_truth,
                 self.prev_train_frame, self.train_flow, self.train_flow_velocity,
                 self.pending_bottleneck_latent, self.pending_world_model_target,
-                self.model.world_model_head, self.discriminator, adv_weight_eff, self.args,
+                self.model.world_model_head, self.discriminator, adv_weight_eff,
+                self.pending_rollout_loss, self.args,
             )
             self.optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -354,6 +416,19 @@ class TrainingEngine:
         else:
             self.pending_bottleneck_latent = None
             self.pending_world_model_target = None
+
+        if rollout_horizon and len(self._buffer) >= rollout_horizon + 1:
+            self._rollout_step_count += 1
+            if self._rollout_step_count % self.args.rollout_every_n_steps == 0:
+                targets = [self._buffer[i] for i in range(1, rollout_horizon + 1)]
+                self.pending_rollout_loss = compute_rollout_loss(
+                    self.model, self.loss_fn, output.pred, output.hidden, targets,
+                    decay=self.args.rollout_decay,
+                )
+            else:
+                self.pending_rollout_loss = None
+        else:
+            self.pending_rollout_loss = None
 
     def _run(self):
         args = self.args
@@ -395,12 +470,16 @@ class TrainingEngine:
                 # reachable in this branch -- never at delay=0, where there's
                 # no buffer to peek ahead into.
                 world_model_horizon = args.world_model_horizon if args.world_model_weight > 0 else None
+                # Rollout-consistency loss (see compute_rollout_loss) sources
+                # its targets the same peeked-buffer way -- same reachability
+                # constraint as the world-model loss above.
+                rollout_horizon = args.rollout_horizon if args.rollout_weight > 0 else None
                 # `while`, not `if`: normally pops at most once per iteration,
                 # but if the delay was just lowered mid-run, `while` lets the
                 # backlog catch back down over the next few iterations.
                 while len(self._buffer) > target_lag:
                     ground_truth = self._buffer.popleft()
-                    self._predict_and_learn(ground_truth, world_model_horizon)
+                    self._predict_and_learn(ground_truth, world_model_horizon, rollout_horizon)
 
                 # --- cosmetic preview: periodic anchor + self-feeding rollout ---
                 # Purely for the display pane; runs under no_grad and never

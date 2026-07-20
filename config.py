@@ -236,6 +236,55 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "representation collapse.",
     )
     p.add_argument(
+        "--rollout-weight",
+        type=float,
+        default=0.1,
+        help="Weight for an auxiliary rollout-consistency loss: after the "
+        "primary loop's forward call this tick, the model self-feeds its own "
+        "prediction for --rollout-horizon more steps (true BPTT -- gradient "
+        "flows across the whole chain, not detached step-by-step), each step "
+        "scored against a real future frame peeked (never popped) from the "
+        "replay buffer (default: 0.1). Exists because the primary predict-"
+        "then-learn loop is strictly teacher-forced and never trains on its "
+        "own prior predictions, so low one-step loss is compatible with the "
+        "model diverging once it has to run several steps ahead of ground "
+        "truth. Set to 0 to disable. NOTE: only active while the real-frame "
+        "delay (--real-frame-interval-frames / the live delay slider) is >= "
+        "--rollout-horizon + 1 -- inactive (a logged no-op) at the default "
+        "delay of 0.",
+    )
+    p.add_argument(
+        "--rollout-horizon",
+        type=int,
+        default=3,
+        help="How many self-fed steps (K) the rollout-consistency loss chains "
+        "forward, each compared against a real future frame peeked from the "
+        "replay buffer (default: 3). Larger values push harder against "
+        "compounding-error drift but cost K extra full model forward passes "
+        "per activation and deepen the retained BPTT graph; must be < "
+        "--real-frame-interval-max-frames for the feature to ever be "
+        "reachable via the delay slider.",
+    )
+    p.add_argument(
+        "--rollout-every-n-steps",
+        type=int,
+        default=8,
+        help="Only run the rollout-consistency K-step chain on every Nth "
+        "eligible training tick (default: 8). This is a real-time training "
+        "loop, and each activation costs --rollout-horizon extra full model "
+        "forward passes, so this bounds the amortized FPS cost. Lower this "
+        "for a stronger/more frequent signal at the cost of framerate.",
+    )
+    p.add_argument(
+        "--rollout-decay",
+        type=float,
+        default=1.0,
+        help="Per-step weight multiplier (decay**i) applied across the "
+        "rollout-consistency chain's K steps (default: 1.0, i.e. flat -- "
+        "every step weighted equally). Values < 1.0 discount later, harder-"
+        "to-predict steps relative to earlier ones.",
+    )
+    p.add_argument(
         "--adv-weight",
         type=float,
         default=0.05,
