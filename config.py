@@ -1,11 +1,51 @@
-"""CLI configuration for krystalball. All tunables live here, not buried in main.py."""
+"""CLI configuration for krystalball. All tunables live here, not buried in main.py.
+
+Defaults can also be supplied by a YAML file (config.yaml by default, see
+--config) -- CLI flags always take precedence over it, and it over the
+hardcoded argparse defaults below. This is pure default-layering: the set of
+flags, their types/choices, and everything that consumes the resulting
+argparse.Namespace are completely unaffected by whether a value came from
+the YAML file or a hardcoded default.
+"""
 
 import argparse
+import os
+
+import yaml
+
+DEFAULT_CONFIG_PATH = "config.yaml"
+
+
+def _load_yaml_defaults(path: str) -> dict:
+    """Reads a YAML file of flag defaults, flattening one level of section
+    grouping (e.g. `resolution: {width: 192}` -> `{"width": 192}`) since
+    config.yaml uses section headers purely for readability. Missing file
+    is not an error -- it just means "use config.py's hardcoded defaults"."""
+    if not path or not os.path.exists(path):
+        return {}
+    with open(path) as f:
+        data = yaml.safe_load(f) or {}
+    flat = {}
+    for key, value in data.items():
+        if isinstance(value, dict):
+            flat.update(value)
+        else:
+            flat[key] = value
+    return flat
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="Live webcam next-frame prediction, trained online in real time."
+    )
+    p.add_argument(
+        "--config",
+        type=str,
+        default=DEFAULT_CONFIG_PATH,
+        help="Path to a YAML file supplying defaults for any flag below "
+        "(default: config.yaml). Explicit CLI flags always override it. "
+        "A missing file is fine -- falls back to this file's hardcoded "
+        "defaults.",
     )
     p.add_argument(
         "--host",
@@ -464,3 +504,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Upper bound (frames) of the real-frame-interval trackbar (default: 60)",
     )
     return p
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parses CLI args with config.yaml (or --config's path) layered in as
+    defaults underneath them. Two passes are needed because --config's own
+    value has to be known before the YAML it names can be loaded and turned
+    into defaults for everything else."""
+    parser = build_arg_parser()
+    config_peek = argparse.ArgumentParser(add_help=False)
+    config_peek.add_argument("--config", type=str, default=DEFAULT_CONFIG_PATH)
+    known, _ = config_peek.parse_known_args(argv)
+    yaml_defaults = _load_yaml_defaults(known.config)
+    if yaml_defaults:
+        parser.set_defaults(**yaml_defaults)
+    return parser.parse_args(argv)

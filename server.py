@@ -59,10 +59,10 @@ import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 
-from config import build_arg_parser
+from config import parse_args
 from training import TrainingEngine
 
-args = build_arg_parser().parse_args()
+args = parse_args()
 
 _divisor = 2 ** args.encoder_scales
 if args.width % _divisor != 0 or args.height % _divisor != 0:

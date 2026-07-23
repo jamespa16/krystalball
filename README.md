@@ -118,7 +118,12 @@ anchored to a real frame or free-running.
 
 Everything tunable at server startup is a CLI flag (see
 `uv run server.py --help` for the full, current list with defaults) —
-nothing is buried in logic. Highlights:
+nothing is buried in logic. Defaults for any of these flags can also be set
+in `config.yaml` (loaded automatically if present; point elsewhere with
+`--config path/to/file.yaml`) — an explicit CLI flag always overrides
+`config.yaml`, which in turn overrides `config.py`'s own hardcoded
+defaults. Handy for pinning a tuned set of values without retyping them on
+every `uv run server.py` invocation. Highlights:
 
 - **Server**: `--host`, `--port`, `--ssl-keyfile`/`--ssl-certfile` (for LAN
   HTTPS access)
@@ -153,7 +158,11 @@ nothing is buried in logic. Highlights:
   (MSE / SSIM / blended)
 - `static/` — browser frontend (`index.html`/`app.js`/`style.css`):
   webcam capture, WebSocket client, canvas rendering, controls
-- `config.py` — all CLI flags/defaults
+- `config.py` — all CLI flags/defaults; also layers in `config.yaml` (or
+  `--config`'s path) as defaults underneath explicit CLI flags
+- `config.yaml` — optional YAML file of flag defaults, one key per CLI flag
+  (dashes become underscores); delete a key to fall back to `config.py`'s
+  hardcoded default for it
 - `idea.md` — the authoritative spec for this project; read it before
   making architectural changes
 

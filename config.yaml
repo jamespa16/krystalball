@@ -1,0 +1,82 @@
+# krystalball configuration defaults.
+#
+# Every key here corresponds 1:1 to a CLI flag in config.py (dashes become
+# underscores, e.g. --flow-smoothness-weight -> flow_smoothness_weight).
+# Values here become the new defaults; any flag passed explicitly on the
+# command line still overrides what's in this file. Section headers
+# (server, resolution, ...) are purely organizational -- they're flattened
+# before use, so don't nest keys any deeper than this.
+#
+# Delete or comment out a key to fall back to config.py's own hardcoded
+# default for it. See `uv run server.py --help` for full descriptions.
+
+server:
+  host: "0.0.0.0"
+  port: 8000
+  ssl_keyfile: null
+  ssl_certfile: null
+
+resolution:
+  width: 192
+  height: 144
+  upscale: 3
+
+training:
+  lr: 0.0002
+  lr_warmup_steps: 200
+  lr_warmup_start_factor: 0.05
+  optimizer: adam
+  loss: mse_ssim
+  ssim_weight: 0.5
+  grad_clip_norm: 0.5
+
+model_architecture:
+  encoder_base_channels: 32
+  encoder_scales: 2
+  res_blocks_per_scale: 2
+  lstm_layers: 4
+  lstm_hidden_channels: 128
+  lstm_kernel_size: 3
+  st_memory_channels: 32
+  skip_lstm_base_channels: 16
+  delta_scale: 0.6
+
+flow_and_motion:
+  use_flow: "on"
+  flow_hidden_channels: 16
+  flow_smoothness_weight: 0.01
+  flow_acceleration: "on"
+  flow_accel_smoothness_weight: 0.01
+  blend_mask: "on"
+
+multistep_loss:
+  multistep_pixel_weight: 0.1
+  multistep_latent_weight: 0.1
+  multistep_horizon: 4
+  multistep_every_n_steps: 8
+  multistep_decay: 1.0
+
+adversarial:
+  adv_weight: 0.05
+  adv_warmup_steps: 500
+  disc_lr: 0.0001
+  disc_base_channels: 32
+  disc_layers: 3
+
+auxiliary_loss_weights:
+  motion_loss_weight: 1.0
+  motion_delta_weight: 0.5
+  uncertainty_clamp: 6.0
+
+device:
+  device: auto
+
+checkpointing:
+  checkpoint_path: checkpoint.pt
+  checkpoint_interval_seconds: 120.0
+  fresh_start: false
+
+replay_buffer:
+  loss_window: 100
+  real_frame_interval_frames: 0
+  real_frame_interval_max_frames: 60
