@@ -12,15 +12,17 @@ const resetBtn = document.getElementById("resetBtn");
 const stopBtn = document.getElementById("stopBtn");
 const saveCheckpointBtn = document.getElementById("saveCheckpointBtn");
 
-// --- loss-vs-time small multiples -------------------------------------
-// Fixed slot order + hue per term (categorical identity assigned by name,
-// never by arrival order or rank -- a term that shows up later still gets
-// its own permanent color). "total" is the reported `avg_loss` (the summed,
-// already-weighted training loss); the rest mirror training.py's
-// `compute_training_loss` breakdown keys and only appear once that term is
-// actually enabled (a CLI weight > 0), so the panel set adapts to config.
-const LOSS_CHARTS_EL = document.getElementById("lossCharts");
-const LOSS_SERIES_ORDER = [
+// --- metric-vs-time small multiples ------------------------------------
+// Fixed slot order + hue per series (categorical identity assigned by name,
+// never by arrival order or rank -- a series that shows up later still gets
+// its own permanent color). "fps" is the engine's rolling frame rate;
+// "total" is the reported `avg_loss` (the summed, already-weighted training
+// loss); the rest mirror training.py's `compute_training_loss` breakdown
+// keys and only appear once that term is actually enabled (a CLI weight >
+// 0), so the panel set adapts to config.
+const METRIC_CHARTS_EL = document.getElementById("metricCharts");
+const SERIES_ORDER = [
+  "fps",
   "total",
   "base",
   "flow_smoothness",
@@ -30,7 +32,11 @@ const LOSS_SERIES_ORDER = [
   "multistep_latent",
   "adversarial",
 ];
-const LOSS_SERIES_COLOR = {
+const SERIES_COLOR = {
+  fps: "#4ade80", // matches the app's own --accent, not a categorical slot --
+  // fps is never shown side-by-side with a loss term for comparison (each
+  // panel is its own single-series facet), so it doesn't need a distinct
+  // categorical hue of its own.
   total: "#3987e5",
   base: "#d95926",
   flow_smoothness: "#199e70",
@@ -40,7 +46,8 @@ const LOSS_SERIES_COLOR = {
   multistep_latent: "#9085e9",
   adversarial: "#e66767",
 };
-const LOSS_SERIES_LABEL = {
+const SERIES_LABEL = {
+  fps: "fps",
   total: "total (avg_loss)",
   base: "base",
   flow_smoothness: "flow smoothness",
@@ -50,25 +57,29 @@ const LOSS_SERIES_LABEL = {
   multistep_latent: "multistep latent",
   adversarial: "adversarial",
 };
-const LOSS_HISTORY_MAX_POINTS = 400; // ~kept per series, oldest dropped first
+const SERIES_DECIMALS = { fps: 1 }; // everything else defaults to 5 (loss-scale values)
+function formatMetricValue(key, value) {
+  return value.toFixed(SERIES_DECIMALS[key] ?? 5);
+}
+const METRIC_HISTORY_MAX_POINTS = 400; // ~kept per series, oldest dropped first
 
-const lossHistory = new Map(); // key -> number[]
-const lossCharts = new Map(); // key -> { canvas, ctx, valueEl }
-let lossChartHover = null; // { key, xFrac } | null
+const metricHistory = new Map(); // key -> number[]
+const metricCharts = new Map(); // key -> { canvas, ctx, valueEl }
+let metricChartHover = null; // { key, xFrac } | null
 
-function ensureLossChart(key) {
-  if (lossCharts.has(key)) return lossCharts.get(key);
+function ensureMetricChart(key) {
+  if (metricCharts.has(key)) return metricCharts.get(key);
 
   const panel = document.createElement("div");
-  panel.className = "loss-chart";
+  panel.className = "metric-chart";
 
   const title = document.createElement("div");
-  title.className = "loss-chart-title";
+  title.className = "metric-chart-title";
   const nameEl = document.createElement("span");
-  nameEl.textContent = LOSS_SERIES_LABEL[key] || key;
-  nameEl.style.color = LOSS_SERIES_COLOR[key] || "var(--chart-secondary)";
+  nameEl.textContent = SERIES_LABEL[key] || key;
+  nameEl.style.color = SERIES_COLOR[key] || "var(--chart-secondary)";
   const valueEl = document.createElement("span");
-  valueEl.className = "loss-chart-value";
+  valueEl.className = "metric-chart-value";
   title.appendChild(nameEl);
   title.appendChild(valueEl);
 
@@ -80,50 +91,50 @@ function ensureLossChart(key) {
 
   // Insert panels in fixed series order regardless of arrival order, so a
   // term that only starts reporting later doesn't reshuffle earlier panels.
-  const order = LOSS_SERIES_ORDER.indexOf(key);
+  const order = SERIES_ORDER.indexOf(key);
   let inserted = false;
-  for (const child of LOSS_CHARTS_EL.children) {
-    const childKey = child.dataset.lossKey;
-    if (LOSS_SERIES_ORDER.indexOf(childKey) > order) {
-      LOSS_CHARTS_EL.insertBefore(panel, child);
+  for (const child of METRIC_CHARTS_EL.children) {
+    const childKey = child.dataset.metricKey;
+    if (SERIES_ORDER.indexOf(childKey) > order) {
+      METRIC_CHARTS_EL.insertBefore(panel, child);
       inserted = true;
       break;
     }
   }
-  if (!inserted) LOSS_CHARTS_EL.appendChild(panel);
-  panel.dataset.lossKey = key;
+  if (!inserted) METRIC_CHARTS_EL.appendChild(panel);
+  panel.dataset.metricKey = key;
 
   canvas.addEventListener("mousemove", (ev) => {
     const rect = canvas.getBoundingClientRect();
     const xFrac = Math.min(1, Math.max(0, (ev.clientX - rect.left) / rect.width));
-    lossChartHover = { key, xFrac };
-    drawLossChart(key);
+    metricChartHover = { key, xFrac };
+    drawMetricChart(key);
   });
   canvas.addEventListener("mouseleave", () => {
-    if (lossChartHover && lossChartHover.key === key) {
-      lossChartHover = null;
-      drawLossChart(key);
+    if (metricChartHover && metricChartHover.key === key) {
+      metricChartHover = null;
+      drawMetricChart(key);
     }
   });
 
   const entry = { canvas, ctx, valueEl };
-  lossCharts.set(key, entry);
+  metricCharts.set(key, entry);
   return entry;
 }
 
-function pushLossSample(key, value) {
-  let history = lossHistory.get(key);
+function pushMetricSample(key, value) {
+  let history = metricHistory.get(key);
   if (!history) {
     history = [];
-    lossHistory.set(key, history);
+    metricHistory.set(key, history);
   }
   history.push(value);
-  if (history.length > LOSS_HISTORY_MAX_POINTS) history.shift();
+  if (history.length > METRIC_HISTORY_MAX_POINTS) history.shift();
 }
 
-function drawLossChart(key) {
-  const entry = lossCharts.get(key);
-  const history = lossHistory.get(key);
+function drawMetricChart(key) {
+  const entry = metricCharts.get(key);
+  const history = metricHistory.get(key);
   if (!entry || !history || history.length === 0) return;
   const { canvas, ctx, valueEl } = entry;
 
@@ -147,7 +158,7 @@ function drawLossChart(key) {
   ctx.clearRect(0, 0, cssWidth, cssHeight);
 
   const latest = history[history.length - 1];
-  valueEl.textContent = latest.toFixed(5);
+  valueEl.textContent = formatMetricValue(key, latest);
 
   let min = Math.min(...history);
   let max = Math.max(...history);
@@ -167,7 +178,7 @@ function drawLossChart(key) {
   const padTop = 4;
   const padBottom = 4;
   const plotHeight = cssHeight - padTop - padBottom;
-  const color = LOSS_SERIES_COLOR[key] || "#c3c2b7";
+  const color = SERIES_COLOR[key] || "#c3c2b7";
 
   // Recessive hairline gridline at the baseline (most-recent-value level
   // isn't special here, so just mark the vertical midline for scale).
@@ -209,8 +220,8 @@ function drawLossChart(key) {
   ctx.fill();
 
   // Hover crosshair + readout for the nearest sample to the cursor.
-  if (lossChartHover && lossChartHover.key === key) {
-    const idx = Math.min(n - 1, Math.round(lossChartHover.xFrac * (n - 1)));
+  if (metricChartHover && metricChartHover.key === key) {
+    const idx = Math.min(n - 1, Math.round(metricChartHover.xFrac * (n - 1)));
     const hx = idx * xStep;
     const hy = yFor(history[idx]);
     ctx.strokeStyle = "#898781";
@@ -229,7 +240,7 @@ function drawLossChart(key) {
     ctx.fill();
 
     const stepsAgo = n - 1 - idx;
-    const label = `${history[idx].toFixed(5)}${stepsAgo > 0 ? `  (-${stepsAgo}f)` : ""}`;
+    const label = `${formatMetricValue(key, history[idx])}${stepsAgo > 0 ? `  (-${stepsAgo}f)` : ""}`;
     ctx.font = "10px ui-monospace, monospace";
     const textWidth = ctx.measureText(label).width;
     let tx = hx + 6;
@@ -240,15 +251,17 @@ function drawLossChart(key) {
   }
 }
 
-function updateLossCharts(msg) {
-  pushLossSample("total", msg.avg_loss);
-  ensureLossChart("total");
+function updateMetricCharts(msg) {
+  pushMetricSample("fps", msg.fps);
+  ensureMetricChart("fps");
+  pushMetricSample("total", msg.avg_loss);
+  ensureMetricChart("total");
   for (const [name, value] of Object.entries(msg.loss_breakdown || {})) {
-    if (!(name in LOSS_SERIES_COLOR)) continue; // unknown term: ignore rather than guess a color
-    pushLossSample(name, value);
-    ensureLossChart(name);
+    if (!(name in SERIES_COLOR)) continue; // unknown term: ignore rather than guess a color
+    pushMetricSample(name, value);
+    ensureMetricChart(name);
   }
-  for (const key of lossCharts.keys()) drawLossChart(key);
+  for (const key of metricCharts.keys()) drawMetricChart(key);
 }
 
 const SEND_FPS = 15;
@@ -337,7 +350,7 @@ function connectWS() {
       if (msg.type === "config") {
         applyConfig(msg);
       } else if (msg.type === "stats") {
-        updateLossCharts(msg);
+        updateMetricCharts(msg);
         const breakdown = Object.entries(msg.loss_breakdown || {})
           .map(([name, value]) => `${name} ${value.toFixed(5)}`)
           .join("  ");
