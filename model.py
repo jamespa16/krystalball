@@ -34,7 +34,7 @@ class PredictorOutput:
     hidden: PredictorHidden
     flow: "torch.Tensor | None"
     flow_velocity: "torch.Tensor | None" = None
-    bottleneck_latent: "torch.Tensor | None" = None  # post-recurrence bottleneck h; world-model target space
+    bottleneck_latent: "torch.Tensor | None" = None  # post-recurrence bottleneck h; project_latent()'s input, unified multistep loss's per-step latent term
     warped_base: "torch.Tensor | None" = None        # flow-warped base frame fed to the decoder's residual path
 
 
@@ -412,7 +412,6 @@ class NextFramePredictor(nn.Module):
                  use_flow: bool = True, flow_hidden_channels: int = 16,
                  use_blend_mask: bool = True, skip_lstm_base_channels: int = 16,
                  use_flow_acceleration: bool = True, st_memory_channels: int = 32,
-                 world_model_hidden_channels: int = 64,
                  initial_weights: dict = None, uncertainty_clamp: float = 6.0):
         super().__init__()
         self.use_flow = use_flow
@@ -423,8 +422,9 @@ class NextFramePredictor(nn.Module):
             )
         # +2 channels for flow, +2 more for velocity when acceleration is enabled.
         # Stashed on self so encode_frame() (a standalone, history-free encoder
-        # pass used by the world-model loss's target embedding) can zero-pad
-        # the same channel count without duplicating this computation.
+        # pass used by the unified multistep loss's per-step latent target,
+        # see training.py's compute_multistep_losses) can zero-pad the same
+        # channel count without duplicating this computation.
         self.flow_channels = (4 if self.use_flow_acceleration else 2) if use_flow else 0
         encoder_in_channels = in_channels + self.flow_channels
         self.encoder = Encoder(
@@ -452,27 +452,37 @@ class NextFramePredictor(nn.Module):
             self.st_lstm.out_channels, decoder_skip_channels, encoder_base_channels,
             in_channels, delta_scale, res_blocks_per_scale, use_blend_mask
         )
-        # Cooperates with the generator (unlike the adversarial Discriminator,
-        # which deliberately lives outside this module) -- rides in the same
-        # optimizer as everything else. Not called from forward(); invoked
-        # explicitly by training.py's world-model loss wiring, like the other
-        # auxiliary losses.
-        self.world_model_head = WorldModelHead(
-            self.st_lstm.out_channels, self.encoder.out_channels, world_model_hidden_channels, kernel_size
-        )
-        # Same rationale as world_model_head above: not called from
-        # forward(), invoked explicitly by training.py's loss wiring, rides
-        # in the same optimizer -- see UncertaintyWeighter.
+        # bottleneck_latent (st_lstm.out_channels, e.g. lstm_hidden_channels)
+        # and encode_frame()'s output (encoder.out_channels) generally live
+        # at different channel counts -- this 1x1 conv is ONLY a channel-
+        # count adapter so latent_consistency_loss can compare them, not a
+        # forecasting network (unlike the deleted WorldModelHead this
+        # replaces, it does no forward-in-time prediction and isn't
+        # conditioned on flow/velocity -- the recurrent core's own
+        # bottleneck_latent already IS the forecast; this just reshapes it
+        # into encode_frame()'s space). Not called from forward(); invoked
+        # explicitly by training.py's compute_multistep_losses.
+        self.latent_proj = nn.Conv2d(self.st_lstm.out_channels, self.encoder.out_channels, 1)
+        # Not called from forward(); invoked explicitly by training.py's loss
+        # wiring, rides in the same optimizer as everything else -- see
+        # UncertaintyWeighter.
         self.loss_weighter = UncertaintyWeighter(initial_weights or {}, clamp=uncertainty_clamp)
+
+    def project_latent(self, bottleneck_latent):
+        """Channel-count adapter from the recurrent core's bottleneck_latent
+        space into encode_frame()'s encoder-feature space -- see
+        self.latent_proj's construction comment. Used by training.py's
+        compute_multistep_losses before latent_consistency_loss."""
+        return self.latent_proj(bottleneck_latent)
 
     def encode_frame(self, frame):
         """Stateless, history-free encoder-only forward pass on a standalone
-        frame -- used to compute the world-model loss's target embedding
-        from a real future frame sitting in the replay buffer, with no
-        recurrent state or flow-warp involved. Zero-pads the same flow/
-        velocity channel slots the encoder normally receives (there's no
-        motion history for a lone frame processed this way), so channel
-        counts match regardless of --use-flow/--flow-acceleration."""
+        frame -- used to compute the unified multistep loss's per-step
+        latent target from a real future frame sitting in the replay
+        buffer, with no recurrent state or flow-warp involved. Zero-pads
+        the same flow/velocity channel slots the encoder normally receives
+        (there's no motion history for a lone frame processed this way),
+        so channel counts match regardless of --use-flow/--flow-acceleration."""
         if self.flow_channels:
             pad = torch.zeros(
                 frame.shape[0], self.flow_channels, frame.shape[2], frame.shape[3],
@@ -630,48 +640,19 @@ def motion_delta_loss(pred: torch.Tensor, target: torch.Tensor,
     return F.mse_loss(pred_delta, real_delta)
 
 
-class WorldModelHead(nn.Module):
-    """Asymmetric predictor mapping the recurrent core's current bottleneck
-    latent to a predicted FUTURE latent in a distinct representation
-    space -- the encoder's own (feedforward, no recurrence) embedding of
-    a real future frame. Conditioned on the current flow/velocity as a
-    motion cue for how far content will have moved by the target horizon.
-    Deliberately a separate small network from the encoder/ST-LSTM whose
-    output it's trained to match, rather than comparing raw bottleneck
-    space to itself -- one of this loss's collapse-resistance measures
-    (see world_model_consistency_loss and TrainingEngine's usage)."""
-
-    def __init__(self, bottleneck_channels: int, target_channels: int,
-                 hidden_channels: int = 64, kernel_size: int = 3):
-        super().__init__()
-        padding = kernel_size // 2
-        self.conv1 = nn.Conv2d(bottleneck_channels + 4, hidden_channels, kernel_size, padding=padding)
-        self.norm1 = _group_norm(hidden_channels)
-        self.conv2 = nn.Conv2d(hidden_channels, hidden_channels, kernel_size, padding=padding)
-        self.norm2 = _group_norm(hidden_channels)
-        self.out = nn.Conv2d(hidden_channels, target_channels, 1)
-
-    def forward(self, bottleneck_latent, flow, velocity):
-        b, _, h, w = bottleneck_latent.shape
-        if flow is not None:
-            flow_ds = _resize_flow(flow, (h, w))
-        else:
-            flow_ds = torch.zeros(b, 2, h, w, device=bottleneck_latent.device, dtype=bottleneck_latent.dtype)
-        vel_ds = _resize_flow(velocity, (h, w)) if velocity is not None else torch.zeros_like(flow_ds)
-        x = F.relu(self.norm1(self.conv1(torch.cat([bottleneck_latent, flow_ds, vel_ds], dim=1))))
-        x = F.relu(self.norm2(self.conv2(x)))
-        return self.out(x)
-
-
-def world_model_consistency_loss(pred_latent: torch.Tensor, target_latent: torch.Tensor) -> torch.Tensor:
+def latent_consistency_loss(pred_latent: torch.Tensor, target_latent: torch.Tensor) -> torch.Tensor:
     """Cosine-similarity latent-consistency loss -- deliberately NOT raw
     MSE: MSE against a detached target can be cheaply "solved" by
     shrinking overall activation magnitude toward zero rather than
     learning real predictive structure, whereas a normalized (cosine)
-    comparison removes that shortcut. One of several collapse-resistance
-    measures for this loss, alongside the stop-gradient target (see
-    TrainingEngine's peek/encode_frame usage, always under no_grad) and
-    WorldModelHead's architectural asymmetry from its own input space."""
+    comparison removes that shortcut. Used by training.py's unified
+    multistep mechanism (compute_multistep_losses) as the per-step latent
+    scoring function: at EVERY step of a self-feeding chain, the model's
+    own recurrent bottleneck latent is compared against a real future
+    frame's stop-gradient encoder embedding (see NextFramePredictor.
+    encode_frame, always called under no_grad) -- there is no separate
+    forecasting network here (unlike the old WorldModelHead this
+    replaces); the recurrent core's own predicted state IS the forecast."""
     pred_n = F.normalize(pred_latent, dim=1)
     target_n = F.normalize(target_latent, dim=1)
     return (1.0 - (pred_n * target_n).sum(dim=1)).mean()

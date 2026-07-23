@@ -24,21 +24,30 @@ Usage:
 Web page controls:
     Delay slider -- "Real frame delay (frames)", snaps to whole-frame
         detents, shows the current value. At 0 every frame is trained on
-        immediately (original 1:1 behavior). Higher values buffer real
-        frames into a small FIFO so training lags real time by that many
-        frames but still eventually trains on every frame, nothing dropped.
+        immediately (original 1:1 behavior) and the prediction pane shows
+        the live one-step prediction (REAL mode). Above 0, "delay N frames"
+        drives two things at once: training lags real time by N frames
+        (real frames buffer into a small FIFO so nothing is dropped), AND
+        the prediction pane switches to FORECAST mode, continuously showing
+        a genuine N-frame look-ahead generated from the model's current
+        (newest-trained) state -- once that forecast is consumed, a fresh
+        one is generated using whatever the model has learned since.
     Reset button -- clears recurrent hidden state, replay buffer, and
         re-initializes the optimizer, without restarting the server.
     Stop button -- pauses training (state preserved, not cleared); sending
         any new frame (e.g. reloading the page and re-granting camera
         access) automatically resumes it.
+    Save Checkpoint button -- persists model/optimizer/discriminator
+        weights to disk on demand (also autosaved periodically); reloaded
+        automatically the next time the server starts, unless --fresh-start.
 
 What you'll see:
     Two panes side by side: [ real webcam frame | model's current
     prediction ], with a stats readout (frame count, FPS, rolling-average
-    training loss, replay-buffer backlog, REAL/FREE-RUN mode). The
-    prediction pane should start out noisy/blurry and grow more temporally
-    coherent over the first 30-60 seconds as the model learns online.
+    training loss, replay-buffer backlog, REAL/FORECAST mode + forecast
+    step/horizon when in FORECAST mode). The prediction pane should start
+    out noisy/blurry and grow more temporally coherent over the first
+    30-60 seconds as the model learns online.
 """
 
 import asyncio
@@ -102,6 +111,8 @@ async def _handle_control_message(engine: TrainingEngine, text: str):
         engine.request_reset()
     elif msg_type == "stop":
         engine.pause()
+    elif msg_type == "save_checkpoint":
+        engine.save_checkpoint()
 
 
 async def _delayed_pause(engine: TrainingEngine, delay: float):
@@ -112,7 +123,12 @@ async def _delayed_pause(engine: TrainingEngine, delay: float):
 async def _pump_output(websocket: WebSocket, engine: TrainingEngine):
     """Polls the engine's output mailbox and forwards new (prediction,
     stats) pairs to the browser at up to OUTPUT_PUMP_HZ -- fully decoupled
-    from the training loop's own rate, and from the browser's send rate."""
+    from the training loop's own rate, and from the browser's send rate.
+    The prediction pane's delay-driven look-ahead forecast (see
+    TrainingEngine._run/generate) rides this same (prediction_jpeg, stats)
+    pair -- there's no separate protocol for it; `stats["mode_label"]`
+    (REAL/FORECAST) plus `forecast_step`/`forecast_horizon` tell the
+    frontend what it's looking at."""
     interval = 1.0 / OUTPUT_PUMP_HZ
     while True:
         item = engine.pop_latest_output()

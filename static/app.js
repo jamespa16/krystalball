@@ -10,6 +10,7 @@ const delaySlider = document.getElementById("delaySlider");
 const delayValueEl = document.getElementById("delayValue");
 const resetBtn = document.getElementById("resetBtn");
 const stopBtn = document.getElementById("stopBtn");
+const saveCheckpointBtn = document.getElementById("saveCheckpointBtn");
 
 const SEND_FPS = 15;
 let ws = null;
@@ -103,9 +104,17 @@ function connectWS() {
         const weights = Object.entries(msg.loss_weights || {})
           .map(([name, value]) => `${name} ${value.toFixed(4)}`)
           .join("  ");
+        // In FORECAST mode the prediction pane is showing a genuine
+        // look-ahead generated from the model's current weights, N frames
+        // ahead (N = delay) -- forecast_step/forecast_horizon show where
+        // in that N-frame window the current displayed frame sits.
+        const modeDetail =
+          msg.mode_label === "FORECAST"
+            ? `${msg.mode_label} ${msg.forecast_step}/${msg.forecast_horizon}`
+            : msg.mode_label;
         statsEl.textContent =
           `frame ${msg.frame_count}  fps ${msg.fps.toFixed(1)}  ` +
-          `loss ${msg.avg_loss.toFixed(5)}  [${msg.mode_label}]  ` +
+          `loss ${msg.avg_loss.toFixed(5)}  [${modeDetail}]  ` +
           `delay ${msg.target_lag}f  buf ${msg.buffer_len}/${msg.target_lag}` +
           (breakdown ? `\n${breakdown}` : "") +
           (weights ? `\nweights: ${weights}` : "");
@@ -137,6 +146,12 @@ delaySlider.addEventListener("input", () => {
 resetBtn.addEventListener("click", () => {
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: "reset" }));
+  }
+});
+
+saveCheckpointBtn.addEventListener("click", () => {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: "save_checkpoint" }));
   }
 });
 

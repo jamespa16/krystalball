@@ -38,20 +38,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=192,
         help="Internal working width in pixels; must be divisible by 2**--encoder-scales "
-        "(default: 96, divisible by 8 for the default 3 scales)",
+        "(default: 192, divisible by 4 for the default 2 scales)",
     )
     p.add_argument(
         "--height",
         type=int,
         default=144,
         help="Internal working height in pixels; must be divisible by 2**--encoder-scales "
-        "(default: 72, divisible by 8 for the default 3 scales)",
+        "(default: 144, divisible by 4 for the default 2 scales)",
     )
     p.add_argument(
         "--upscale",
         type=int,
         default=3,
-        help="Factor to upscale each pane by for display only (default: 6)",
+        help="Factor to upscale each pane by for display only (default: 3)",
     )
     p.add_argument(
         "--lr", type=float, default=2e-4, help="Optimizer learning rate (default: 2e-4)"
@@ -75,7 +75,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=32,
         help="Encoder first-stage channel count; doubles at each subsequent "
-        "downsample stage (default: 32, giving 32/64/128 for the default 3 scales)",
+        "downsample stage (default: 32, giving 32/64 for the default 2 scales)",
     )
     p.add_argument(
         "--encoder-scales",
@@ -83,14 +83,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=2,
         help="Number of stride-2 downsample stages in the encoder/decoder "
         "(total spatial downsample = 2**this). --width/--height must be "
-        "divisible by 2**this (default: 3, i.e. divisible by 8)",
+        "divisible by 2**this (default: 2, i.e. divisible by 4)",
     )
     p.add_argument(
         "--res-blocks-per-scale",
         type=int,
         default=2,
         help="Number of GroupNorm residual blocks after each encoder downsample "
-        "/ before each decoder upsample (default: 1)",
+        "/ before each decoder upsample (default: 2)",
     )
     p.add_argument(
         "--lstm-layers",
@@ -98,7 +98,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=4,
         help="Number of bottleneck-depth spatiotemporal-LSTM cells stacked after "
         "the (optional) skip-scale cells in the hierarchical ST-LSTM core "
-        "(default: 2) -- the cross-scale memory `m` zigzags through these last, "
+        "(default: 4) -- the cross-scale memory `m` zigzags through these last, "
         "after every skip scale.",
     )
     p.add_argument(
@@ -206,94 +206,80 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--flow-acceleration on.",
     )
     p.add_argument(
-        "--world-model-weight",
+        "--multistep-pixel-weight",
         type=float,
         default=0.1,
-        help="Weight for an auxiliary latent-space consistency loss: a small "
-        "predictor head maps the recurrent core's current bottleneck latent to "
-        "a predicted future latent, compared (cosine distance) against the real "
-        "encoder features of a genuine future frame, --world-model-horizon "
-        "frames ahead (default: 0.1). Makes the internal representation more "
-        "predictive of actual future content, not just good for one-step pixel "
-        "reconstruction. This is now only the term's INITIAL weight, which then "
-        "adapts via learned uncertainty weighting (see --uncertainty-clamp). "
-        "Set to 0 to disable entirely. NOTE: only active while the real-"
-        "frame delay (--real-frame-interval-frames / the live delay slider) is "
-        ">= --world-model-horizon, since the lookahead frame is sourced by "
-        "peeking the existing replay buffer rather than a new buffering "
-        "mechanism -- inactive (a logged no-op) at the default delay of 0.",
+        help="Weight for the pixel-space half of the unified multistep self-"
+        "consistency loss: after the primary loop's forward call this tick, "
+        "the model self-feeds its own prediction for --multistep-horizon more "
+        "steps (true BPTT -- gradient flows across the whole chain, not "
+        "detached step-by-step), each step scored against a real future frame "
+        "peeked (never popped) from the replay buffer (default: 0.1). Exists "
+        "because the primary predict-then-learn loop is strictly teacher-"
+        "forced and never trains on its own prior predictions, so low one-"
+        "step loss is compatible with the model diverging once it has to run "
+        "several steps ahead of ground truth. This is now only the term's "
+        "INITIAL weight, which then adapts via learned uncertainty weighting "
+        "(see --uncertainty-clamp). Set to 0 to disable just this half while "
+        "keeping --multistep-latent-weight active, or set both to 0 to "
+        "disable the whole chain (saving its --multistep-horizon extra "
+        "forward passes per activation). NOTE: only active while the real-"
+        "frame delay (--real-frame-interval-frames / the live delay slider) "
+        "is >= --multistep-horizon + 1 -- inactive (a logged no-op) at the "
+        "default delay of 0.",
     )
     p.add_argument(
-        "--world-model-horizon",
+        "--multistep-latent-weight",
+        type=float,
+        default=0.1,
+        help="Weight for the latent-space half of the unified multistep self-"
+        "consistency loss: at EACH step of the SAME self-feeding chain "
+        "described under --multistep-pixel-weight, also compares (cosine "
+        "distance) the model's own recurrent bottleneck latent against the "
+        "real encoder features of the corresponding real future frame "
+        "(default: 0.1) -- this scores the recurrent core's own predicted "
+        "state directly (via NextFramePredictor.encode_frame), rather than "
+        "routing through a separate forecasting network. Makes the internal "
+        "representation more predictive of actual future content, not just "
+        "good for one-step pixel reconstruction. This is now only the term's "
+        "INITIAL weight, which then adapts via learned uncertainty weighting "
+        "(see --uncertainty-clamp). Set to 0 to disable just this half while "
+        "keeping --multistep-pixel-weight active. Same reachability "
+        "constraint as --multistep-pixel-weight (see its help).",
+    )
+    p.add_argument(
+        "--multistep-horizon",
         type=int,
         default=4,
-        help="How many frames ahead (peeked from the replay buffer) the world-"
-        "model predictor head targets (default: 4). Larger values make the "
-        "objective harder (less correlated with the present) but push the "
-        "representation to encode longer-range predictive structure; must be "
-        "<= --real-frame-interval-max-frames for the feature to ever be "
-        "reachable via the delay slider.",
+        help="How many self-fed steps (K) the unified multistep loss chains "
+        "forward (default: 4), each step scored BOTH as pixel loss "
+        "(--multistep-pixel-weight) and latent consistency "
+        "(--multistep-latent-weight) against a real future frame peeked from "
+        "the replay buffer. Larger values push harder against compounding-"
+        "error drift and longer-range representation structure, but cost K "
+        "extra full model forward passes per activation and deepen the "
+        "retained BPTT graph; must be < --real-frame-interval-max-frames for "
+        "the feature to ever be reachable via the delay slider.",
     )
     p.add_argument(
-        "--world-model-hidden-channels",
-        type=int,
-        default=64,
-        help="Hidden channel count of the world-model predictor head's internal "
-        "conv layers (default: 64). Deliberately a separate small network from "
-        "the encoder/ST-LSTM whose output it's trained to match (an asymmetric "
-        "predictor head), which is itself part of this loss's defense against "
-        "representation collapse.",
-    )
-    p.add_argument(
-        "--rollout-weight",
-        type=float,
-        default=0.1,
-        help="Weight for an auxiliary rollout-consistency loss: after the "
-        "primary loop's forward call this tick, the model self-feeds its own "
-        "prediction for --rollout-horizon more steps (true BPTT -- gradient "
-        "flows across the whole chain, not detached step-by-step), each step "
-        "scored against a real future frame peeked (never popped) from the "
-        "replay buffer (default: 0.1). Exists because the primary predict-"
-        "then-learn loop is strictly teacher-forced and never trains on its "
-        "own prior predictions, so low one-step loss is compatible with the "
-        "model diverging once it has to run several steps ahead of ground "
-        "truth. This is now only the term's INITIAL weight, which then adapts "
-        "via learned uncertainty weighting (see --uncertainty-clamp). Set to "
-        "0 to disable entirely. NOTE: only active while the real-frame "
-        "delay (--real-frame-interval-frames / the live delay slider) is >= "
-        "--rollout-horizon + 1 -- inactive (a logged no-op) at the default "
-        "delay of 0.",
-    )
-    p.add_argument(
-        "--rollout-horizon",
-        type=int,
-        default=3,
-        help="How many self-fed steps (K) the rollout-consistency loss chains "
-        "forward, each compared against a real future frame peeked from the "
-        "replay buffer (default: 3). Larger values push harder against "
-        "compounding-error drift but cost K extra full model forward passes "
-        "per activation and deepen the retained BPTT graph; must be < "
-        "--real-frame-interval-max-frames for the feature to ever be "
-        "reachable via the delay slider.",
-    )
-    p.add_argument(
-        "--rollout-every-n-steps",
+        "--multistep-every-n-steps",
         type=int,
         default=8,
-        help="Only run the rollout-consistency K-step chain on every Nth "
+        help="Only run the unified multistep K-step chain on every Nth "
         "eligible training tick (default: 8). This is a real-time training "
-        "loop, and each activation costs --rollout-horizon extra full model "
-        "forward passes, so this bounds the amortized FPS cost. Lower this "
-        "for a stronger/more frequent signal at the cost of framerate.",
+        "loop, and each activation costs --multistep-horizon extra full "
+        "model forward passes, so this bounds the amortized FPS cost. Lower "
+        "this for a stronger/more frequent signal at the cost of framerate.",
     )
     p.add_argument(
-        "--rollout-decay",
+        "--multistep-decay",
         type=float,
         default=1.0,
         help="Per-step weight multiplier (decay**i) applied across the "
-        "rollout-consistency chain's K steps (default: 1.0, i.e. flat -- "
-        "every step weighted equally). Values < 1.0 discount later, harder-"
-        "to-predict steps relative to earlier ones.",
+        "multistep chain's K steps, identically for both the pixel and "
+        "latent halves (default: 1.0, i.e. flat -- every step weighted "
+        "equally). Values < 1.0 discount later, harder-to-predict steps "
+        "relative to earlier ones.",
     )
     p.add_argument(
         "--adv-weight",
@@ -405,9 +391,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Clamp bound on the learned log-variance behind each auxiliary "
         "loss term's weight (--flow-smoothness-weight, "
         "--flow-accel-smoothness-weight, --motion-delta-weight, "
-        "--world-model-weight, --adv-weight, --rollout-weight all now only "
-        "set that term's INITIAL weight; from then on it's a trained "
-        "parameter -- see model.py's UncertaintyWeighter) (default: 6.0, i.e. "
+        "--multistep-pixel-weight, --multistep-latent-weight, --adv-weight "
+        "all now only set that term's INITIAL weight; from then on it's a "
+        "trained parameter -- see model.py's UncertaintyWeighter) (default: 6.0, i.e. "
         "each term's weight can range roughly [0.0025, 403] from its initial "
         "value). Guards against runaway under this project's noisy single-"
         "frame (batch-size-1) online updates, where there's no checkpointing "
@@ -425,6 +411,36 @@ def build_arg_parser() -> argparse.ArgumentParser:
         choices=["auto", "cpu", "cuda", "mps"],
         default="auto",
         help="Compute device; 'auto' picks GPU/MPS if available (default: auto)",
+    )
+    p.add_argument(
+        "--checkpoint-path",
+        type=str,
+        default="checkpoint.pt",
+        help="Path to persist/restore model + optimizer + discriminator weights "
+        "(default: checkpoint.pt, relative to the working directory). Loaded "
+        "automatically at startup if the file exists (unless --fresh-start), "
+        "and saved automatically every --checkpoint-interval-seconds plus "
+        "on-demand via the web UI's Save Checkpoint control. Like Reset, only "
+        "WEIGHTS persist -- hidden state, the replay buffer, and the cosmetic "
+        "display-rollout state always start fresh on load; they are never part "
+        "of the checkpoint.",
+    )
+    p.add_argument(
+        "--checkpoint-interval-seconds",
+        type=float,
+        default=120.0,
+        help="How often (wall-clock seconds) to autosave a checkpoint to "
+        "--checkpoint-path while the server runs (default: 120.0). Set to 0 "
+        "to disable autosave entirely (checkpointing then only happens via "
+        "the web UI's on-demand Save Checkpoint control, if used).",
+    )
+    p.add_argument(
+        "--fresh-start",
+        action="store_true",
+        help="Ignore any existing --checkpoint-path file at startup and begin "
+        "from a freshly initialized model instead (default: off, i.e. load "
+        "the checkpoint if present). Does not delete the existing file -- the "
+        "next autosave/manual save simply overwrites it once training resumes.",
     )
     p.add_argument(
         "--loss-window",
