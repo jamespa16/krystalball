@@ -17,18 +17,23 @@ server:
   ssl_certfile: null
 
 resolution:
-  width: 192
-  height: 144
-  upscale: 3
+  width: 96
+  height: 72
+  upscale: 6
 
 training:
-  lr: 0.0002
-  lr_warmup_steps: 200
+  lr: 0.002
+  lr_warmup_steps: 20
   lr_warmup_start_factor: 0.05
   optimizer: adam
   loss: mse_ssim
   ssim_weight: 0.5
   grad_clip_norm: 0.5
+  loss_spike_guard: "on"
+  loss_spike_threshold: 8.0
+  loss_spike_min_history: 20
+  loss_spike_auto_reset_window: 50
+  loss_spike_auto_reset_threshold: 10
 
 model_architecture:
   encoder_base_channels: 32

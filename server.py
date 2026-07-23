@@ -40,6 +40,11 @@ Web page controls:
     Save Checkpoint button -- persists model/optimizer/discriminator
         weights to disk on demand (also autosaved periodically); reloaded
         automatically the next time the server starts, unless --fresh-start.
+    Delete Checkpoint & Start Over button -- deletes the on-disk checkpoint
+        (if any) AND reinitializes the model/discriminator to fresh, untrained
+        weights in place -- the live equivalent of --fresh-start, no server
+        restart required. Unlike Reset, this discards learned weights
+        entirely; irreversible, so the browser confirms before sending it.
 
 What you'll see:
     Two panes side by side: [ real webcam frame | model's current
@@ -113,6 +118,8 @@ async def _handle_control_message(engine: TrainingEngine, text: str):
         engine.pause()
     elif msg_type == "save_checkpoint":
         engine.save_checkpoint()
+    elif msg_type == "delete_checkpoint":
+        engine.request_delete_checkpoint_and_restart()
 
 
 async def _delayed_pause(engine: TrainingEngine, delay: float):

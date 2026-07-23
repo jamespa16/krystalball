@@ -14,6 +14,7 @@ import os
 import threading
 import time
 from collections import defaultdict, deque
+from dataclasses import dataclass
 
 import torch
 
@@ -119,14 +120,27 @@ def compute_multistep_losses(model, loss_fn, seed_pred, seed_hidden, targets, de
     return pixel_total, latent_total
 
 
-def compute_training_loss(loss_fn, pred, target, prev_frame, flow, flow_velocity,
+@dataclass
+class BufferedFrame:
+    """One replay-buffer entry: both resolutions of the SAME real frame,
+    so a delayed pop (see TrainingEngine._run's buffered branch) yields the
+    internal-res tensor (model input / multistep targets) and the display-
+    res tensor (superres head's ground truth) for that one corresponding
+    frame together, without disturbing the buffer's core pop-based FIFO
+    semantics that the delay slider / v7's rollout / v9's multistep peek all
+    depend on."""
+    internal: torch.Tensor
+    target_sr: torch.Tensor
+
+
+def compute_training_loss(loss_fn, pred, target, pred_sr, target_sr, prev_frame, flow, flow_velocity,
                            multistep_losses, discriminator, adv_ramp_fraction,
                            loss_weighter, args):
     """Composes the swappable base photometric loss with the optional
     additive auxiliary terms (flow smoothness, flow-acceleration
     smoothness, motion-delta magnitude, the two halves of the unified
-    multistep self-consistency loss, adversarial), shared by both the
-    delay=0 and buffered training branches.
+    multistep self-consistency loss, adversarial, superres reconstruction),
+    shared by both the delay=0 and buffered training branches.
 
     Each auxiliary term's contribution is `loss_weighter.weighted_term(name, raw)`
     -- learned homoscedastic uncertainty weighting (Kendall, Gal & Cipolla
@@ -191,6 +205,12 @@ def compute_training_loss(loss_fn, pred, target, prev_frame, flow, flow_velocity
         term = loss_weighter.weighted_term("motion_delta", motion_delta_loss(pred, target, prev_frame))
         loss = loss + term
         breakdown["motion_delta"] = term.item()
+    if "superres" in loss_weighter.log_vars:
+        # Plain reconstruction loss only (no motion weight_map -- that would
+        # need a target-res prev_frame too, out of scope for this term).
+        term = loss_weighter.weighted_term("superres", loss_fn(pred_sr, target_sr))
+        loss = loss + term
+        breakdown["superres"] = term.item()
     if "multistep_pixel" in loss_weighter.log_vars:
         if multistep_losses is not None:
             term = loss_weighter.weighted_term("multistep_pixel", multistep_losses[0])
@@ -217,13 +237,12 @@ class TrainingEngine:
     """Owns the model/optimizer/hidden-state and runs the predict-then-learn
     loop on a dedicated background thread for the lifetime of the process."""
 
-    def __init__(self, args, device):
-        self.args = args
-        self.device = device
-        self.width = args.width
-        self.height = args.height
-        self.frame_count = 0  # set before load_checkpoint() below, which may override it
-
+    def _build_model(self):
+        """Constructs a freshly-initialized NextFramePredictor from
+        self.args -- factored out of __init__ so `_do_delete_checkpoint_and_
+        restart` can rebuild an untrained model in place, identically to
+        how the process would construct one from scratch at startup."""
+        args = self.args
         # Static CLI weights for the auxiliary loss terms now only seed each
         # term's INITIAL learned-uncertainty weight (see model.py's
         # UncertaintyWeighter) -- omitting a term here (weight 0) still
@@ -235,8 +254,9 @@ class TrainingEngine:
             "multistep_pixel": args.multistep_pixel_weight,
             "multistep_latent": args.multistep_latent_weight,
             "adversarial": args.adv_weight,
+            "superres": args.superres_weight,
         }
-        self.model = NextFramePredictor(
+        return NextFramePredictor(
             encoder_base_channels=args.encoder_base_channels,
             encoder_scales=args.encoder_scales,
             res_blocks_per_scale=args.res_blocks_per_scale,
@@ -252,7 +272,30 @@ class TrainingEngine:
             st_memory_channels=args.st_memory_channels,
             initial_weights=initial_weights,
             uncertainty_clamp=args.uncertainty_clamp,
-        ).to(device)
+            upscale=args.upscale,
+            superres_channels=args.superres_channels,
+            superres_blocks=args.superres_blocks,
+            superres_delta_scale=args.superres_delta_scale,
+        ).to(self.device)
+
+    def _build_discriminator(self):
+        """Constructs a freshly-initialized Discriminator from self.args --
+        see _build_model's docstring."""
+        args = self.args
+        return Discriminator(
+            in_channels=3, base_channels=args.disc_base_channels, num_layers=args.disc_layers,
+        ).to(self.device)
+
+    def __init__(self, args, device):
+        self.args = args
+        self.device = device
+        self.width = args.width
+        self.height = args.height
+        self.target_width = args.width * args.upscale
+        self.target_height = args.height * args.upscale
+        self.frame_count = 0  # set before load_checkpoint() below, which may override it
+
+        self.model = self._build_model()
         self.optimizer, self.lr_scheduler = make_optimizer_and_scheduler(
             args.optimizer, self.model.parameters(), args.lr,
             args.lr_warmup_steps, args.lr_warmup_start_factor,
@@ -264,9 +307,7 @@ class TrainingEngine:
         # self.model.parameters(), or the generator's optimizer step would
         # also update the discriminator using the generator's own gradients,
         # defeating the adversarial setup entirely.
-        self.discriminator = Discriminator(
-            in_channels=3, base_channels=args.disc_base_channels, num_layers=args.disc_layers,
-        ).to(device)
+        self.discriminator = self._build_discriminator()
         self.disc_optimizer = make_optimizer(args.optimizer, self.discriminator.parameters(), args.disc_lr)
         self._adv_step_count = 0  # drives the adversarial-weight warmup ramp, restarted on reset
 
@@ -278,6 +319,7 @@ class TrainingEngine:
         # genuine (buffered) frames, never the model's own predictions.
         self.train_hidden = None
         self.train_pred = None  # prediction awaiting the next buffered ground-truth frame
+        self.train_pred_sr = None  # display-resolution counterpart of train_pred (see model.py's SuperResHead)
         self.train_flow = None  # flow field from the last train-path forward call
         self.train_flow_velocity = None  # flow-velocity field from the last train-path forward call
         self.prev_train_frame = None  # previous training-consumed frame, for motion-weighted loss
@@ -303,6 +345,14 @@ class TrainingEngine:
         # one-per-iteration so every real frame is eventually trained on.
         self._buffer = deque()
         self._loss_history = deque(maxlen=args.loss_window)
+        self._loss_spike_count = 0  # lifetime count of ticks the guard has rejected, reset on Reset
+        # Rolling window of the last --loss-spike-auto-reset-window ticks'
+        # accept/reject outcomes (True = rejected) -- when at least
+        # --loss-spike-auto-reset-threshold of them are rejections,
+        # _predict_and_learn auto-triggers _reset_optimizer_state() and
+        # clears this deque, so a fresh run of rejections is needed to
+        # trigger again rather than re-firing every subsequent tick.
+        self._loss_spike_window = deque(maxlen=max(1, args.loss_spike_auto_reset_window))
         # Per-term rolling history (see compute_training_loss's `breakdown`
         # return value), keyed lazily so only terms with a nonzero CLI
         # weight ever show up -- lets the stats readout show each loss
@@ -324,6 +374,7 @@ class TrainingEngine:
         self._lock = threading.Lock()  # guards _target_lag only
         self._target_lag = args.real_frame_interval_frames
         self._reset_requested = threading.Event()
+        self._restart_requested = threading.Event()
         self._paused = threading.Event()
         self._shutdown = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -398,6 +449,15 @@ class TrainingEngine:
     def request_reset(self):
         self._reset_requested.set()
 
+    def request_delete_checkpoint_and_restart(self):
+        """Called from the async WebSocket handler (a different thread than
+        the training loop) -- just flags the request; the actual work
+        happens on the training thread itself inside `_run`, at the same
+        point `_reset_requested` is consumed, so it can never race a
+        forward/backward call that's using self.model/self.discriminator
+        mid-step."""
+        self._restart_requested.set()
+
     def pause(self):
         self._paused.set()
 
@@ -418,7 +478,9 @@ class TrainingEngine:
         what happens target_lag frames ahead, using the newest trained
         weights available at generation time. Returns [] if there's no
         seed yet (train_pred is None, e.g. before the first frame or right
-        after a reset)."""
+        after a reset). Returned frames are display-resolution (pred_sr) --
+        the self-feeding chain itself still recurs at internal resolution
+        (inp stays output.pred, never output.pred_sr)."""
         if self.train_pred is None:
             return []
         num_frames = max(1, int(num_frames))
@@ -427,7 +489,7 @@ class TrainingEngine:
             hidden, inp = self.train_hidden, self.train_pred.clamp(0, 1)
             for _ in range(num_frames):
                 output = self.model(inp, hidden)
-                frames.append(output.pred.clamp(0, 1))
+                frames.append(output.pred_sr.clamp(0, 1))
                 hidden, inp = output.hidden, output.pred.clamp(0, 1)
         return frames
 
@@ -473,18 +535,15 @@ class TrainingEngine:
         print(f"[krystalball] checkpoint loaded: {path} (frame_count={self.frame_count})")
         return True
 
-    def _do_reset(self):
-        print("[krystalball] reset: clearing hidden/replay-buffer/optimizer state")
-        self.train_hidden = None
-        self.train_pred = None
-        self.train_flow = None
-        self.train_flow_velocity = None
-        self.prev_train_frame = None
-        self.pending_multistep_losses = None
-        self._multistep_step_count = 0
-        self._display_rollout = []
-        self._display_rollout_idx = 0
-        self._buffer.clear()
+    def _reset_optimizer_state(self):
+        """Reinitializes optimizer/scheduler/discriminator-optimizer (and
+        restarts their warmup ramps) via the same construction path as
+        __init__, WITHOUT touching model/discriminator weights, hidden
+        state, the replay buffer, or loss history. Factored out of
+        `_do_reset` so the loss-spike guard's automatic optimizer reset
+        (see `_predict_and_learn`) can trigger exactly this same subset on
+        its own, without also wiping hidden state / the replay buffer the
+        way a full manual Reset does."""
         self.optimizer, self.lr_scheduler = make_optimizer_and_scheduler(
             self.args.optimizer, self.model.parameters(), self.args.lr,
             self.args.lr_warmup_steps, self.args.lr_warmup_start_factor,
@@ -498,10 +557,90 @@ class TrainingEngine:
             self.args.optimizer, self.discriminator.parameters(), self.args.disc_lr
         )
         self._adv_step_count = 0
+
+    def _do_reset(self):
+        print("[krystalball] reset: clearing hidden/replay-buffer/optimizer state")
+        self.train_hidden = None
+        self.train_pred = None
+        self.train_pred_sr = None
+        self.train_flow = None
+        self.train_flow_velocity = None
+        self.prev_train_frame = None
+        self.pending_multistep_losses = None
+        self._multistep_step_count = 0
+        self._display_rollout = []
+        self._display_rollout_idx = 0
+        self._buffer.clear()
+        self._reset_optimizer_state()
         self._loss_history.clear()
         self._loss_component_history.clear()
+        self._loss_spike_count = 0
+        self._loss_spike_window.clear()
 
-    def _predict_and_learn(self, ground_truth, multistep_horizon=None):
+    def _do_delete_checkpoint_and_restart(self, path=None):
+        """The live, no-restart-required equivalent of `--fresh-start`,
+        triggered from the web UI's "Delete Checkpoint & Start Over"
+        control. Unlike Reset (`_do_reset`, which deliberately PRESERVES
+        learned weights so it can recover from instability without losing
+        training progress), this discards them entirely: the on-disk
+        checkpoint is removed (so a future server restart can't reload it
+        either) and a brand-new model/discriminator replace the current
+        ones in place via `_build_model`/`_build_discriminator`. Reassigning
+        self.model/self.discriminator BEFORE calling `_do_reset()` means its
+        existing optimizer-rebuild logic (which reads `self.model.
+        parameters()`/`self.discriminator.parameters()`) picks up the fresh
+        weights for free -- no duplicated optimizer-construction code.
+        Runs on the training thread only (see
+        request_delete_checkpoint_and_restart), same as `_do_reset`."""
+        path = path or self.args.checkpoint_path
+        if os.path.exists(path):
+            os.remove(path)
+            print(f"[krystalball] checkpoint deleted: {path}")
+        else:
+            print(f"[krystalball] delete-checkpoint-and-restart: no checkpoint at {path} to delete")
+        self.model = self._build_model()
+        self.discriminator = self._build_discriminator()
+        self.frame_count = 0  # the old count no longer corresponds to any trained weights
+        self._do_reset()
+        print("[krystalball] delete-checkpoint-and-restart: model/discriminator "
+              "reinitialized from scratch")
+
+    def _loss_spike_baseline(self):
+        """Rolling (mean, std) over `_loss_history` as it stands BEFORE this
+        tick's loss is appended -- so a spike can never poison the very
+        baseline used to detect it. Returns None while there's too little
+        history (startup / right after a Reset) for mean/std to be
+        meaningful, per --loss-spike-min-history."""
+        history = self._loss_history
+        if len(history) < self.args.loss_spike_min_history:
+            return None
+        mean = sum(history) / len(history)
+        variance = sum((x - mean) ** 2 for x in history) / len(history)
+        return mean, math.sqrt(variance)
+
+    def _is_loss_spike(self, loss_value):
+        """True if this tick's composed training loss should be rejected --
+        i.e. the optimizer/discriminator step skipped even though the
+        forward pass already ran. Non-finite loss (NaN/Inf, e.g. a stray
+        div-by-zero in SSIM or an unclamped log) is always rejected
+        regardless of --loss-spike-guard, since stepping on it would
+        permanently corrupt the model's weights with NaN -- there's no
+        batch to average it away and no epoch boundary to recover at in
+        this online, single-frame-at-a-time setup. Otherwise (guard on),
+        also rejects an outlier against the recent rolling loss
+        distribution: mean + --loss-spike-threshold * std over the last
+        --loss-window losses."""
+        if not math.isfinite(loss_value):
+            return True
+        if self.args.loss_spike_guard != "on":
+            return False
+        baseline = self._loss_spike_baseline()
+        if baseline is None:
+            return False
+        mean, std = baseline
+        return loss_value > mean + self.args.loss_spike_threshold * std
+
+    def _predict_and_learn(self, ground_truth, ground_truth_sr, multistep_horizon=None):
         """One predict-then-learn step against a genuine ground-truth frame
         (either the live frame directly, or one popped off the replay
         buffer) -- shared by both the delay=0 and buffered branches of
@@ -521,7 +660,15 @@ class TrainingEngine:
         the primary loop's own next-step term) BOTH as pixel loss and
         latent consistency, gated by a single --multistep-every-n-steps
         cadence counter. Stashed one-tick-stale, consumed together with
-        the primary pixel loss one tick later (see compute_training_loss)."""
+        the primary pixel loss one tick later (see compute_training_loss).
+
+        The composed loss is checked by `_is_loss_spike` before backward()
+        -- see --loss-spike-guard. On a spike, the optimizer/discriminator
+        step is skipped entirely for this tick (weights untouched), but the
+        forward pass on `ground_truth` below and the hidden-state detach
+        still happen exactly as normal, so a rejected tick looks like any
+        other tick from the outside (prediction/display keep flowing,
+        backprop still spans exactly one timestep next tick)."""
         if self.train_pred is not None:
             # Adversarial ramp fraction (0..1), mirroring the LR-warmup
             # pattern but as a manually tracked ramp (it scales a loss
@@ -538,45 +685,93 @@ class TrainingEngine:
             adv_ramp_fraction = min(1.0, self._adv_step_count / max(1, self.args.adv_warmup_steps))
             loss, loss_breakdown = compute_training_loss(
                 self.loss_fn, self.train_pred, ground_truth,
+                self.train_pred_sr, ground_truth_sr,
                 self.prev_train_frame, self.train_flow, self.train_flow_velocity,
                 self.pending_multistep_losses, self.discriminator, adv_ramp_fraction,
                 self.model.loss_weighter, self.args,
             )
-            self.optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            if self.args.grad_clip_norm > 0:
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.grad_clip_norm)
-            self.optimizer.step()
-            if self.lr_scheduler is not None:
-                self.lr_scheduler.step()
-            self._loss_history.append(loss.item())
-            for term_name, term_value in loss_breakdown.items():
-                self._loss_component_history[term_name].append(term_value)
-            # Cut the graph so next timestep's backward can't walk
-            # back through this one -- backprop spans exactly one step.
-            self.train_hidden = detach_hidden(self.train_hidden)
+            loss_value = loss.item()
+            is_spike = self._is_loss_spike(loss_value)
+            self._loss_spike_window.append(is_spike)
+            if is_spike:
+                self._loss_spike_count += 1
+                baseline = self._loss_spike_baseline()
+                baseline_str = f"recent avg {baseline[0]:.4g} +/- {baseline[1]:.4g}" if baseline else "no baseline yet"
+                print(f"[krystalball] WARNING: loss spike guard rejected this update "
+                      f"(loss={loss_value:.4g}, {baseline_str}) -- frame #{self.frame_count}, "
+                      f"total rejections={self._loss_spike_count}")
+                # A handful of isolated spikes is normal (see
+                # --loss-spike-auto-reset-window's help); a SUSTAINED high
+                # rejection rate means something the per-tick guard alone
+                # can't fix is going on (e.g. a corrupted hidden state that
+                # keeps producing bad loss every tick regardless of
+                # weights) -- so this requests the SAME full reset the
+                # manual Reset control performs (hidden state/replay
+                # buffer/optimizer state; model weights untouched), not
+                # just the optimizer. `not self._reset_requested.is_set()`
+                # avoids re-triggering (and re-logging) on every remaining
+                # tick this same request is pending -- the buffered branch
+                # of `_run` can call `_predict_and_learn` several times
+                # per tick while draining a backlog, all before the
+                # request is actually consumed at the end of that tick.
+                rejected_in_window = sum(self._loss_spike_window)
+                if (self.args.loss_spike_auto_reset_threshold > 0
+                        and rejected_in_window >= self.args.loss_spike_auto_reset_threshold
+                        and not self._reset_requested.is_set()):
+                    window_len = len(self._loss_spike_window)
+                    print(f"[krystalball] WARNING: loss spike guard auto-reset triggered "
+                          f"({rejected_in_window}/{window_len} recent ticks rejected >= "
+                          f"--loss-spike-auto-reset-threshold {self.args.loss_spike_auto_reset_threshold}) "
+                          f"-- requesting the same reset as the manual Reset control")
+                    self.request_reset()
+            else:
+                self.optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                if self.args.grad_clip_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.grad_clip_norm)
+                self.optimizer.step()
+                if self.lr_scheduler is not None:
+                    self.lr_scheduler.step()
 
-            # --- discriminator step: fresh forward passes on (real, fake) ---
-            # `self.train_pred` here is still the JUST-SCORED pending
-            # prediction (reassigned to the new one below) -- exactly the
-            # (ground_truth, pred) pair the generator step above judged.
-            self.disc_optimizer.zero_grad(set_to_none=True)
-            d_loss = lsgan_d_loss(
-                self.discriminator(ground_truth), self.discriminator(self.train_pred.detach())
-            )
-            d_loss.backward()
-            if self.args.grad_clip_norm > 0:
-                torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), self.args.grad_clip_norm)
-            self.disc_optimizer.step()
+                # --- discriminator step: fresh forward passes on (real, fake) ---
+                # `self.train_pred` here is still the JUST-SCORED pending
+                # prediction (reassigned to the new one below) -- exactly the
+                # (ground_truth, pred) pair the generator step above judged.
+                # Skipped alongside the generator step above on a rejected
+                # tick, so the discriminator never trains on a pair the
+                # guard itself flagged as anomalous.
+                self.disc_optimizer.zero_grad(set_to_none=True)
+                d_loss = lsgan_d_loss(
+                    self.discriminator(ground_truth), self.discriminator(self.train_pred.detach())
+                )
+                d_loss.backward()
+                if self.args.grad_clip_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), self.args.grad_clip_norm)
+                self.disc_optimizer.step()
+                # Only a tick that actually trained feeds the rolling
+                # history -- both the on-screen average (which should
+                # reflect what the model learned from, not a rejected
+                # outlier) and _is_loss_spike's own baseline (which must
+                # never be poisoned by the very spikes it exists to catch;
+                # a NaN in particular would permanently break mean/std via
+                # NaN propagation until it aged out of the window).
+                self._loss_history.append(loss_value)
+                for term_name, term_value in loss_breakdown.items():
+                    self._loss_component_history[term_name].append(term_value)
+            # Cut the graph so next timestep's backward can't walk back
+            # through this one -- backprop spans exactly one step, whether
+            # or not this tick's step was rejected above.
+            self.train_hidden = detach_hidden(self.train_hidden)
         output = self.model(ground_truth, self.train_hidden)
         self.train_pred, self.train_hidden = output.pred, output.hidden
+        self.train_pred_sr = output.pred_sr
         self.train_flow, self.train_flow_velocity = output.flow, output.flow_velocity
         self.prev_train_frame = ground_truth
 
         if multistep_horizon and len(self._buffer) >= multistep_horizon + 1:
             self._multistep_step_count += 1
             if self._multistep_step_count % self.args.multistep_every_n_steps == 0:
-                targets = [self._buffer[i] for i in range(1, multistep_horizon + 1)]
+                targets = [self._buffer[i].internal for i in range(1, multistep_horizon + 1)]
                 self.pending_multistep_losses = compute_multistep_losses(
                     self.model, self.loss_fn, output.pred, output.hidden, targets,
                     decay=self.args.multistep_decay,
@@ -598,11 +793,19 @@ class TrainingEngine:
                 time.sleep(0.005)
                 continue
             try:
-                real_tensor = frame_codec.decode_jpeg_to_tensor(
-                    jpeg, self.width, self.height, self.device
-                )
+                frame_bgr = frame_codec.decode_jpeg_to_bgr(jpeg)
             except ValueError:
                 continue
+            real_tensor = frame_codec.bgr_to_tensor(frame_bgr, self.width, self.height, self.device)
+            # Display-resolution counterpart of the same frame -- ground
+            # truth for the superres head's reconstruction loss, and (see
+            # below) what the prediction pane shows before any forecast
+            # exists. The browser now sends frames pre-sized to target
+            # resolution (width*upscale x height*upscale, see static/app.js),
+            # so this is typically a no-resize no-op (see bgr_to_tensor).
+            real_tensor_sr = frame_codec.bgr_to_tensor(
+                frame_bgr, self.target_width, self.target_height, self.device
+            )
 
             # --- real-frame interval: how far training lags behind live video ---
             # target_lag is the replay-buffer delay in frames (0 = original
@@ -615,13 +818,13 @@ class TrainingEngine:
 
             if interval_frames == 1:
                 # --- predict-then-learn, one step behind (no buffering) ---
-                self._predict_and_learn(real_tensor)
-                pred_for_display = self.train_pred
+                self._predict_and_learn(real_tensor, real_tensor_sr)
+                pred_for_display = self.train_pred_sr
                 mode_label = "REAL"
                 forecast_step, forecast_horizon = 0, 0
             else:
                 # --- replay buffer: train on every frame, just delayed ---
-                self._buffer.append(real_tensor)
+                self._buffer.append(BufferedFrame(real_tensor, real_tensor_sr))
                 # Unified multistep loss (see compute_multistep_losses)
                 # sources its lookahead targets by peeking this same buffer,
                 # so it's only reachable in this branch -- never at delay=0,
@@ -635,8 +838,8 @@ class TrainingEngine:
                 # but if the delay was just lowered mid-run, `while` lets the
                 # backlog catch back down over the next few iterations.
                 while len(self._buffer) > target_lag:
-                    ground_truth = self._buffer.popleft()
-                    self._predict_and_learn(ground_truth, multistep_horizon)
+                    buffered = self._buffer.popleft()
+                    self._predict_and_learn(buffered.internal, buffered.target_sr, multistep_horizon)
 
                 # --- delay-driven look-ahead forecast: "delay N frames"
                 # means both "train N frames behind" (above) AND "show N
@@ -657,7 +860,7 @@ class TrainingEngine:
                     pred_for_display = self._display_rollout[self._display_rollout_idx]
                     self._display_rollout_idx += 1
                 else:
-                    pred_for_display = real_tensor  # no seed yet (e.g. right after reset)
+                    pred_for_display = real_tensor_sr  # no seed yet (e.g. right after reset)
                 mode_label = "FORECAST"
                 forecast_step = self._display_rollout_idx
                 forecast_horizon = len(self._display_rollout)
@@ -702,6 +905,7 @@ class TrainingEngine:
                 "forecast_horizon": forecast_horizon,
                 "buffer_len": len(self._buffer),
                 "target_lag": target_lag,
+                "loss_spike_count": self._loss_spike_count,
             }
             self._output.put((pred_jpeg, stats))
 
@@ -711,6 +915,14 @@ class TrainingEngine:
                 self.save_checkpoint()
                 self._last_checkpoint_time = now_ckpt
 
-            if self._reset_requested.is_set():
+            # Checked before the plain reset request below: restart already
+            # performs a full _do_reset() internally, so if both happen to
+            # be flagged on the same tick there's no need to also run the
+            # (redundant, cheaper) plain reset.
+            if self._restart_requested.is_set():
+                self._do_delete_checkpoint_and_restart()
+                self._restart_requested.clear()
+                self._reset_requested.clear()
+            elif self._reset_requested.is_set():
                 self._do_reset()
                 self._reset_requested.clear()

@@ -11,26 +11,36 @@ const delayValueEl = document.getElementById("delayValue");
 const resetBtn = document.getElementById("resetBtn");
 const stopBtn = document.getElementById("stopBtn");
 const saveCheckpointBtn = document.getElementById("saveCheckpointBtn");
+const deleteCheckpointBtn = document.getElementById("deleteCheckpointBtn");
 
 // --- metric-vs-time small multiples ------------------------------------
 // Fixed slot order + hue per series (categorical identity assigned by name,
 // never by arrival order or rank -- a series that shows up later still gets
 // its own permanent color). "fps" is the engine's rolling frame rate;
-// "total" is the reported `avg_loss` (the summed, already-weighted training
-// loss); the rest mirror training.py's `compute_training_loss` breakdown
-// keys and only appear once that term is actually enabled (a CLI weight >
-// 0), so the panel set adapts to config.
+// "base" (the unweighted photometric loss, compute_training_loss's anchor
+// term) is the primary/headline loss series -- unlike every other term it's
+// never run through UncertaintyWeighter, so it stays a real, always->=0
+// reconstruction-error reading. "total" is the reported `avg_loss` (the
+// full weighted sum used for backward()); because most auxiliary terms'
+// learned-uncertainty contribution converges to `1 + log(raw_loss)` (see
+// model.py's UncertaintyWeighter), it routinely goes negative once those
+// terms' raw losses drop below 1/e -- expected, not a sign of broken
+// training, but a poor choice of headline number. The rest mirror
+// training.py's `compute_training_loss` breakdown keys and only appear once
+// that term is actually enabled (a CLI weight > 0), so the panel set adapts
+// to config.
 const METRIC_CHARTS_EL = document.getElementById("metricCharts");
 const SERIES_ORDER = [
   "fps",
-  "total",
   "base",
+  "total",
   "flow_smoothness",
   "flow_accel_smoothness",
   "motion_delta",
   "multistep_pixel",
   "multistep_latent",
   "adversarial",
+  "superres",
 ];
 const SERIES_COLOR = {
   fps: "#4ade80", // matches the app's own --accent, not a categorical slot --
@@ -45,17 +55,19 @@ const SERIES_COLOR = {
   multistep_pixel: "#008300",
   multistep_latent: "#9085e9",
   adversarial: "#e66767",
+  superres: "#5ec8d8",
 };
 const SERIES_LABEL = {
   fps: "fps",
-  total: "total (avg_loss)",
-  base: "base",
+  total: "total (avg_loss, can go negative -- see base)",
+  base: "base (reconstruction loss)",
   flow_smoothness: "flow smoothness",
   flow_accel_smoothness: "flow accel smoothness",
   motion_delta: "motion delta",
   multistep_pixel: "multistep pixel",
   multistep_latent: "multistep latent",
   adversarial: "adversarial",
+  superres: "superres reconstruction",
 };
 const SERIES_DECIMALS = { fps: 1 }; // everything else defaults to 5 (loss-scale values)
 function formatMetricValue(key, value) {
@@ -270,7 +282,7 @@ let sendTimer = null;
 let sendCanvas = null;
 let sendCtx = null;
 let stopped = false;
-let cfg = { width: 96, height: 72, upscale: 6, max_lag: 60 };
+let cfg = { width: 192, height: 144, upscale: 3, max_lag: 60 };
 
 function applyConfig(newCfg) {
   cfg = newCfg;
@@ -282,16 +294,22 @@ function applyConfig(newCfg) {
   realCanvas.width = dispW;
   realCanvas.height = dispH;
 
-  // Prediction pane: buffer is the tiny internal resolution the model
-  // actually predicts at; CSS scales it up blockily (see style.css).
-  predCanvas.width = cfg.width;
-  predCanvas.height = cfg.height;
-  predCanvas.style.width = dispW + "px";
-  predCanvas.style.height = dispH + "px";
+  // Prediction pane: the server now streams a genuine learned-superres JPEG
+  // already at display resolution (model.py's SuperResHead) -- shown 1:1,
+  // no CSS stretch needed (superseded; see style.css).
+  predCanvas.width = dispW;
+  predCanvas.height = dispH;
+  predCanvas.style.width = "";
+  predCanvas.style.height = "";
 
+  // sendCanvas now captures at DISPLAY resolution, not internal resolution
+  // -- the server needs a genuine high-res frame to train the superres
+  // head's reconstruction loss against (it separately downsizes
+  // server-side to internal resolution for the model's own input; see
+  // frame_codec.py).
   sendCanvas = document.createElement("canvas");
-  sendCanvas.width = cfg.width;
-  sendCanvas.height = cfg.height;
+  sendCanvas.width = dispW;
+  sendCanvas.height = dispH;
   sendCtx = sendCanvas.getContext("2d");
 
   delaySlider.max = cfg.max_lag;
@@ -365,10 +383,24 @@ function connectWS() {
           msg.mode_label === "FORECAST"
             ? `${msg.mode_label} ${msg.forecast_step}/${msg.forecast_horizon}`
             : msg.mode_label;
+        // loss_spike_count is a lifetime (since start/last Reset) counter of
+        // ticks the --loss-spike-guard rejected -- only shown once it's
+        // nonzero so the normal-operation readout stays uncluttered.
+        const spikeNote = msg.loss_spike_count > 0 ? `  spikes ${msg.loss_spike_count}` : "";
+        // Headline number is the unweighted base (reconstruction) loss, not
+        // `avg_loss` (the full UncertaintyWeighter-weighted total fed to
+        // backward()) -- most auxiliary terms' weighted contribution
+        // converges toward `1 + log(raw_loss)` (see model.py's
+        // UncertaintyWeighter), so avg_loss routinely goes negative even
+        // while training is healthy. avg_loss is still shown as "total" in
+        // the breakdown line/chart below, just no longer the headline.
+        const headlineLoss = msg.loss_breakdown && "base" in msg.loss_breakdown
+          ? msg.loss_breakdown.base
+          : msg.avg_loss;
         statsEl.textContent =
           `frame ${msg.frame_count}  fps ${msg.fps.toFixed(1)}  ` +
-          `loss ${msg.avg_loss.toFixed(5)}  [${modeDetail}]  ` +
-          `delay ${msg.target_lag}f  buf ${msg.buffer_len}/${msg.target_lag}` +
+          `loss ${headlineLoss.toFixed(5)}  [${modeDetail}]  ` +
+          `delay ${msg.target_lag}f  buf ${msg.buffer_len}/${msg.target_lag}${spikeNote}` +
           (breakdown ? `\n${breakdown}` : "") +
           (weights ? `\nweights: ${weights}` : "");
       }
@@ -405,6 +437,20 @@ resetBtn.addEventListener("click", () => {
 saveCheckpointBtn.addEventListener("click", () => {
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: "save_checkpoint" }));
+  }
+});
+
+// Irreversible (deletes the on-disk checkpoint AND discards the model's
+// current learned weights in place, unlike Reset) -- confirm before sending.
+deleteCheckpointBtn.addEventListener("click", () => {
+  if (!confirm(
+    "Delete the saved checkpoint and reinitialize the model from scratch?\n\n" +
+    "This discards all trained weights and cannot be undone."
+  )) {
+    return;
+  }
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: "delete_checkpoint" }));
   }
 });
 

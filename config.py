@@ -91,7 +91,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--upscale",
         type=int,
         default=3,
-        help="Factor to upscale each pane by for display only (default: 3)",
+        help="Factor the model's learned upsample head (see --superres-channels) scales "
+        "its internal-resolution prediction by to reach display resolution; also the "
+        "factor the browser now captures/sends frames at (width*upscale x height*upscale) "
+        "so the server has genuine high-res ground truth to train that head against "
+        "(default: 3)",
     )
     p.add_argument(
         "--lr", type=float, default=2e-4, help="Optimizer learning rate (default: 2e-4)"
@@ -383,6 +387,33 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "off if this introduces training instability.",
     )
     p.add_argument(
+        "--superres-channels",
+        type=int,
+        default=32,
+        help="Hidden channel count for the learned upsample head (SuperResHead) that "
+        "takes the internal-resolution prediction up to display resolution (see "
+        "--upscale). Set to 0 to disable the learned head entirely -- falls back to "
+        "plain bilinear upsampling (still produces a display-resolution frame; the "
+        "browser no longer does its own CSS/nearest-neighbor stretch), mirroring the "
+        "--skip-lstm-base-channels 0 disable convention (default: 32). Ignored "
+        "(no-op regardless of value) when --upscale <= 1.",
+    )
+    p.add_argument(
+        "--superres-blocks",
+        type=int,
+        default=2,
+        help="Number of residual blocks in the learned upsample head's internal-"
+        "resolution conv stack (default: 2)",
+    )
+    p.add_argument(
+        "--superres-delta-scale",
+        type=float,
+        default=0.5,
+        help="Max magnitude of the learned upsample head's residual added on top of "
+        "its plain-bilinear base, analogous to --delta-scale for the main decoder "
+        "(default: 0.5)",
+    )
+    p.add_argument(
         "--optimizer",
         choices=["adam", "sgd"],
         default="adam",
@@ -425,15 +456,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--uncertainty-clamp). Set to 0 to disable entirely.",
     )
     p.add_argument(
+        "--superres-weight",
+        type=float,
+        default=1.0,
+        help="Weight for the reconstruction loss between the learned upsample head's "
+        "display-resolution output and the genuine display-resolution ground-truth "
+        "frame (see --superres-channels), using the same swappable --loss function as "
+        "the base photometric term. Unlike the other auxiliary terms here, this IS "
+        "the feature's point -- a 0 default would leave the head at its zero-init "
+        "bilinear-only output forever, never training (default: 1.0). This is now "
+        "only the term's INITIAL weight, which then adapts via learned uncertainty "
+        "weighting (see --uncertainty-clamp). Set to 0 to disable the loss term "
+        "while still computing/displaying the (untrained, or bilinear-fallback) "
+        "upsampled output -- independent of --superres-channels.",
+    )
+    p.add_argument(
         "--uncertainty-clamp",
         type=float,
         default=6.0,
         help="Clamp bound on the learned log-variance behind each auxiliary "
         "loss term's weight (--flow-smoothness-weight, "
         "--flow-accel-smoothness-weight, --motion-delta-weight, "
-        "--multistep-pixel-weight, --multistep-latent-weight, --adv-weight "
-        "all now only set that term's INITIAL weight; from then on it's a "
-        "trained parameter -- see model.py's UncertaintyWeighter) (default: 6.0, i.e. "
+        "--multistep-pixel-weight, --multistep-latent-weight, --adv-weight, "
+        "--superres-weight all now only set that term's INITIAL weight; from then on "
+        "it's a trained parameter -- see model.py's UncertaintyWeighter) (default: 6.0, i.e. "
         "each term's weight can range roughly [0.0025, 403] from its initial "
         "value). Guards against runaway under this project's noisy single-"
         "frame (batch-size-1) online updates, where there's no checkpointing "
@@ -445,6 +491,76 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=0.5,
         help="Max L2 norm for gradient clipping, applied after backward() and "
         "before optimizer.step(); set to 0 to disable (default: 0.5)",
+    )
+    p.add_argument(
+        "--loss-spike-guard",
+        choices=["on", "off"],
+        default="on",
+        help="Reject (skip optimizer.step()/discriminator step for) any tick "
+        "whose composed training loss is non-finite (NaN/Inf) or an outlier "
+        "against the recent rolling loss distribution -- see "
+        "--loss-spike-threshold (default: on). Online single-frame training "
+        "has no batch to average a bad frame away and no epoch boundary to "
+        "recover at, so one corrupted gradient (camera glitch, hand over the "
+        "lens, a flash) can otherwise permanently drag the model into a bad "
+        "region. Rejects the UPDATE only, not the frame -- the forward pass "
+        "and hidden-state detach still happen every tick either way, so "
+        "prediction/display keep running. Non-finite loss is always rejected "
+        "regardless of this flag; set to off to disable the rolling-outlier "
+        "half only.",
+    )
+    p.add_argument(
+        "--loss-spike-threshold",
+        type=float,
+        default=8.0,
+        help="A tick's loss is rejected as a spike when it exceeds "
+        "(recent rolling mean) + this many (recent rolling std) of the last "
+        "--loss-window losses (default: 8.0). Lower catches smaller spikes "
+        "at the risk of rejecting genuine hard-but-legitimate frames "
+        "(fast motion, lighting changes); raise if real spikes are being "
+        "missed. Ignored (non-finite is still always rejected) when "
+        "--loss-spike-guard off.",
+    )
+    p.add_argument(
+        "--loss-spike-min-history",
+        type=int,
+        default=20,
+        help="Minimum number of recent losses required before the rolling-"
+        "outlier half of the spike guard arms (default: 20) -- too few "
+        "samples make the rolling mean/std unreliable, e.g. right after "
+        "startup or a Reset. Non-finite loss is still always rejected below "
+        "this count.",
+    )
+    p.add_argument(
+        "--loss-spike-auto-reset-window",
+        type=int,
+        default=50,
+        help="Number of most-recent training ticks (accepted or rejected) "
+        "the loss-spike guard looks back over when deciding whether to "
+        "auto-trigger a full Reset (default: 50) -- see "
+        "--loss-spike-auto-reset-threshold. A handful of isolated spikes is "
+        "normal (a bright reflection, a hand crossing the frame); it's a "
+        "SUSTAINED high rejection rate -- e.g. a corrupted hidden state that "
+        "keeps producing bad loss every tick regardless of weights -- that "
+        "the per-tick guard alone can't fix, since it only ever skips the "
+        "update, never touches hidden/optimizer state.",
+    )
+    p.add_argument(
+        "--loss-spike-auto-reset-threshold",
+        type=int,
+        default=10,
+        help="If at least this many of the last --loss-spike-auto-reset-"
+        "window ticks were rejected by the loss-spike guard, automatically "
+        "trigger the SAME reset the manual Reset control performs -- "
+        "recurrent hidden state, the replay buffer, and optimizer/"
+        "scheduler state (Adam/SGD moving averages, LR/adversarial-weight "
+        "warmup ramps) are all cleared/reinitialized (default: 10, i.e. a "
+        "20% rejection rate over the default 50-tick window). Model/"
+        "discriminator WEIGHTS are never touched by this, same as manual "
+        "Reset. The rejection-count window is cleared as part of that "
+        "reset, so it takes a fresh run of rejections to trigger again "
+        "rather than re-firing every subsequent tick. Set to 0 to disable "
+        "auto-reset entirely.",
     )
     p.add_argument(
         "--device",

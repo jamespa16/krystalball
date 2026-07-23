@@ -3,6 +3,7 @@
   --bg: #111318;
   --fg: #e6e6e6;
   --accent: #4ade80;
+  --danger: #f87171;
   --panel: #1b1e26;
   --chart-muted: #898781;
   --chart-secondary: #c3c2b7;
@@ -47,14 +48,6 @@ h1 {
   height: auto;
 }
 
-/* The prediction pane is upsampled from a tiny internal-resolution frame,
-   so it should look blocky (nearest-neighbor), matching the old cv2
-   INTER_NEAREST display upscale; the real pane is drawn directly from the
-   video element at full display resolution and stays smooth. */
-#predCanvas {
-  image-rendering: pixelated;
-}
-
 .pane-label {
   position: absolute;
   bottom: 0.75rem;
@@ -95,6 +88,15 @@ h1 {
 
 .controls button:hover {
   border-color: var(--accent);
+}
+
+.controls button.danger {
+  color: var(--danger);
+  border-color: #5a2a2a;
+}
+
+.controls button.danger:hover {
+  border-color: var(--danger);
 }
 
 /* Metric-vs-time small multiples: one line chart per active series (fps

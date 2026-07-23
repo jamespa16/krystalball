@@ -36,6 +36,7 @@ class PredictorOutput:
     flow_velocity: "torch.Tensor | None" = None
     bottleneck_latent: "torch.Tensor | None" = None  # post-recurrence bottleneck h; project_latent()'s input, unified multistep loss's per-step latent term
     warped_base: "torch.Tensor | None" = None        # flow-warped base frame fed to the decoder's residual path
+    pred_sr: "torch.Tensor | None" = None            # target-resolution prediction from SuperResHead (or its bilinear fallback); see NextFramePredictor.forward
 
 
 def _group_norm(channels: int, max_groups: int = 8) -> nn.GroupNorm:
@@ -393,6 +394,43 @@ class Decoder(nn.Module):
         return (base_frame + delta).clamp(0.0, 1.0)
 
 
+class SuperResHead(nn.Module):
+    """Learned upsample tail: takes the decoder's internal-resolution
+    prediction and produces a target-resolution (internal_res * upscale)
+    frame, via subpixel convolution (conv stack at cheap internal
+    resolution, then one parameter-free PixelShuffle rearrangement to
+    target resolution) adding a zero-initialized residual on top of a
+    plain bilinear upsample -- the same "zero-init residual on a sane
+    base" convention as Decoder's final_up and FlowHead's refine-not-
+    rederive pattern, so a fresh model's SR output starts pixel-identical
+    to plain bilinear and only improves from training. Stateless (pure
+    per-frame image-to-image): the recurrent core already owns all
+    temporal modeling, this module has no forward-in-time role of its own."""
+
+    def __init__(self, upscale: int, channels: int = 32, num_blocks: int = 2,
+                 in_channels: int = 3, delta_scale: float = 0.5):
+        super().__init__()
+        self.upscale = upscale
+        self.delta_scale = delta_scale
+        self.in_conv = nn.Conv2d(in_channels, channels, 3, padding=1)
+        self.res_blocks = nn.ModuleList([ResBlock(channels) for _ in range(num_blocks)])
+        self.to_subpixel = nn.Conv2d(channels, in_channels * upscale * upscale, 3, padding=1)
+        # Zero-init: at construction, delta = delta_scale * tanh(0) = 0, so
+        # a fresh model's SR output is exactly the bilinear base below --
+        # the same exact-identity-at-init guarantee as Decoder.final_up.
+        nn.init.zeros_(self.to_subpixel.weight)
+        nn.init.zeros_(self.to_subpixel.bias)
+        self.pixel_shuffle = nn.PixelShuffle(upscale)
+
+    def forward(self, pred):
+        base = F.interpolate(pred, scale_factor=self.upscale, mode="bilinear", align_corners=False)
+        x = self.in_conv(pred)
+        for block in self.res_blocks:
+            x = block(x)
+        delta = self.delta_scale * torch.tanh(self.pixel_shuffle(self.to_subpixel(x)))
+        return (base + delta).clamp(0.0, 1.0)
+
+
 class NextFramePredictor(nn.Module):
     """(flow-warp) -> encoder -> HierarchicalSTLSTM (spanning both skip
     scales and bottleneck depth) -> decoder. Carries recurrent state
@@ -412,8 +450,22 @@ class NextFramePredictor(nn.Module):
                  use_flow: bool = True, flow_hidden_channels: int = 16,
                  use_blend_mask: bool = True, skip_lstm_base_channels: int = 16,
                  use_flow_acceleration: bool = True, st_memory_channels: int = 32,
-                 initial_weights: dict = None, uncertainty_clamp: float = 6.0):
+                 initial_weights: dict = None, uncertainty_clamp: float = 6.0,
+                 upscale: int = 1, superres_channels: int = 32, superres_blocks: int = 2,
+                 superres_delta_scale: float = 0.5):
         super().__init__()
+        self.upscale = upscale
+        if superres_channels > 0 and upscale > 1:
+            self.upsample_head = SuperResHead(
+                upscale, superres_channels, superres_blocks, in_channels, superres_delta_scale
+            )
+        else:
+            # --superres-channels 0 (or --upscale <= 1) disables the learned
+            # head entirely -- forward() falls back to plain F.interpolate
+            # bilinear in this case, so pred_sr is always populated and no
+            # caller needs None-checks, matching --skip-lstm-base-channels
+            # 0's disable convention elsewhere in this file.
+            self.upsample_head = None
         self.use_flow = use_flow
         self.use_flow_acceleration = use_flow_acceleration and use_flow
         if use_flow:
@@ -558,9 +610,14 @@ class NextFramePredictor(nn.Module):
         new_hidden = PredictorHidden(
             st_lstm=st_hidden, prev_frame=x, prev_flow=flow, prev_flow_velocity=velocity,
         )
+        if self.upscale > 1:
+            pred_sr = self.upsample_head(pred) if self.upsample_head is not None \
+                else F.interpolate(pred, scale_factor=self.upscale, mode="bilinear", align_corners=False)
+        else:
+            pred_sr = pred
         return PredictorOutput(
             pred=pred, hidden=new_hidden, flow=flow, flow_velocity=velocity,
-            bottleneck_latent=bottleneck_latent, warped_base=warped,
+            bottleneck_latent=bottleneck_latent, warped_base=warped, pred_sr=pred_sr,
         )
 
 
