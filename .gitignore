@@ -2,6 +2,8 @@ __pycache__/
 *.pyc
 venv/
 .venv/
+.DS_Store
+checkpoint.pt
 
 # Self-signed TLS cert/key for local LAN HTTPS (getUserMedia secure-context
 # requirement) -- generate your own, see README/CLAUDE.md.
