@@ -66,6 +66,7 @@ h1 {
   font-family: ui-monospace, monospace;
   font-size: 0.85rem;
   color: var(--accent);
+  white-space: pre-line;
 }
 
 .controls {

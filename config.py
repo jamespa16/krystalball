@@ -14,7 +14,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Interface for the web server to bind to (default: 0.0.0.0, i.e. all interfaces)",
     )
     p.add_argument(
-        "--port", type=int, default=8000, help="Port for the web server to listen on (default: 8000)"
+        "--port",
+        type=int,
+        default=8000,
+        help="Port for the web server to listen on (default: 8000)",
     )
     p.add_argument(
         "--ssl-keyfile",
@@ -33,21 +36,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--width",
         type=int,
-        default=96,
+        default=192,
         help="Internal working width in pixels; must be divisible by 2**--encoder-scales "
         "(default: 96, divisible by 8 for the default 3 scales)",
     )
     p.add_argument(
         "--height",
         type=int,
-        default=72,
+        default=144,
         help="Internal working height in pixels; must be divisible by 2**--encoder-scales "
         "(default: 72, divisible by 8 for the default 3 scales)",
     )
     p.add_argument(
         "--upscale",
         type=int,
-        default=6,
+        default=3,
         help="Factor to upscale each pane by for display only (default: 6)",
     )
     p.add_argument(
@@ -77,7 +80,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--encoder-scales",
         type=int,
-        default=3,
+        default=2,
         help="Number of stride-2 downsample stages in the encoder/decoder "
         "(total spatial downsample = 2**this). --width/--height must be "
         "divisible by 2**this (default: 3, i.e. divisible by 8)",
@@ -85,14 +88,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--res-blocks-per-scale",
         type=int,
-        default=1,
+        default=2,
         help="Number of GroupNorm residual blocks after each encoder downsample "
         "/ before each decoder upsample (default: 1)",
     )
     p.add_argument(
         "--lstm-layers",
         type=int,
-        default=2,
+        default=4,
         help="Number of bottleneck-depth spatiotemporal-LSTM cells stacked after "
         "the (optional) skip-scale cells in the hierarchical ST-LSTM core "
         "(default: 2) -- the cross-scale memory `m` zigzags through these last, "
@@ -172,8 +175,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Edge-aware total-variation regularization weight on the predicted "
         "flow field (units: raw pixel-displacement, a much larger scale than the "
         "photometric loss -- keep this small) (default: 0.01). Too large a value "
-        "can collapse flow back toward the zero-init trivial solution. Set to 0 "
-        "to disable. Ignored when --use-flow off.",
+        "can collapse flow back toward the zero-init trivial solution. This is "
+        "now only the term's INITIAL weight -- see --uncertainty-clamp -- which "
+        "then adapts automatically via learned uncertainty weighting. Set to 0 "
+        "to disable entirely. Ignored when --use-flow off.",
     )
     p.add_argument(
         "--flow-acceleration",
@@ -195,8 +200,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "flow-VELOCITY field, analogous to --flow-smoothness-weight but for the "
         "acceleration term (default: 0.01). Velocity is, like flow, supervised "
         "only indirectly through the downstream warp -- without this it can "
-        "drift noisily in textureless/occluded regions. Set to 0 to disable. "
-        "Ignored unless --flow-acceleration on.",
+        "drift noisily in textureless/occluded regions. Like --flow-smoothness-"
+        "weight, this is now only the term's INITIAL weight under learned "
+        "uncertainty weighting. Set to 0 to disable entirely. Ignored unless "
+        "--flow-acceleration on.",
     )
     p.add_argument(
         "--world-model-weight",
@@ -208,7 +215,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "encoder features of a genuine future frame, --world-model-horizon "
         "frames ahead (default: 0.1). Makes the internal representation more "
         "predictive of actual future content, not just good for one-step pixel "
-        "reconstruction. Set to 0 to disable. NOTE: only active while the real-"
+        "reconstruction. This is now only the term's INITIAL weight, which then "
+        "adapts via learned uncertainty weighting (see --uncertainty-clamp). "
+        "Set to 0 to disable entirely. NOTE: only active while the real-"
         "frame delay (--real-frame-interval-frames / the live delay slider) is "
         ">= --world-model-horizon, since the lookahead frame is sourced by "
         "peeking the existing replay buffer rather than a new buffering "
@@ -248,7 +257,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "then-learn loop is strictly teacher-forced and never trains on its "
         "own prior predictions, so low one-step loss is compatible with the "
         "model diverging once it has to run several steps ahead of ground "
-        "truth. Set to 0 to disable. NOTE: only active while the real-frame "
+        "truth. This is now only the term's INITIAL weight, which then adapts "
+        "via learned uncertainty weighting (see --uncertainty-clamp). Set to "
+        "0 to disable entirely. NOTE: only active while the real-frame "
         "delay (--real-frame-interval-frames / the live delay slider) is >= "
         "--rollout-horizon + 1 -- inactive (a logged no-op) at the default "
         "delay of 0.",
@@ -293,9 +304,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "less-blurry predictions than photometric loss alone rewards (default: "
         "0.05 -- kept small since this optimizes realism/sharpness, not exact "
         "pixel correctness; too high can let the generator hallucinate detail "
-        "unfaithful to actual content). Ramped up from 0 over --adv-warmup-steps. "
-        "Set to 0 to disable (the discriminator still trains, just has no effect "
-        "on the generator).",
+        "unfaithful to actual content). Ramped up from 0 over --adv-warmup-steps, "
+        "then this is only the term's INITIAL weight beyond that ramp -- it then "
+        "adapts via learned uncertainty weighting (see --uncertainty-clamp). "
+        "Set to 0 to disable entirely (the discriminator still trains, just has "
+        "no effect on the generator).",
     )
     p.add_argument(
         "--adv-warmup-steps",
@@ -381,7 +394,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "distinct from --motion-loss-weight (which only reweights the existing "
         "photometric loss, it doesn't add a new term) -- directly supervises "
         "whether the model predicts the right amount of motion, not just correct "
-        "final pixels (default: 0.5). Set to 0 to disable.",
+        "final pixels (default: 0.5). This is now only the term's INITIAL "
+        "weight, which then adapts via learned uncertainty weighting (see "
+        "--uncertainty-clamp). Set to 0 to disable entirely.",
+    )
+    p.add_argument(
+        "--uncertainty-clamp",
+        type=float,
+        default=6.0,
+        help="Clamp bound on the learned log-variance behind each auxiliary "
+        "loss term's weight (--flow-smoothness-weight, "
+        "--flow-accel-smoothness-weight, --motion-delta-weight, "
+        "--world-model-weight, --adv-weight, --rollout-weight all now only "
+        "set that term's INITIAL weight; from then on it's a trained "
+        "parameter -- see model.py's UncertaintyWeighter) (default: 6.0, i.e. "
+        "each term's weight can range roughly [0.0025, 403] from its initial "
+        "value). Guards against runaway under this project's noisy single-"
+        "frame (batch-size-1) online updates, where there's no checkpointing "
+        "to recover from a bad value.",
     )
     p.add_argument(
         "--grad-clip-norm",

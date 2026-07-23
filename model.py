@@ -4,6 +4,7 @@ multi-scale Decoder next-frame predictor, with GroupNorm residual blocks,
 an acceleration-aware optical-flow head, plus a swappable loss factory
 (MSE / SSIM / blended)."""
 
+import math
 from dataclasses import dataclass, fields, is_dataclass, replace
 
 import torch
@@ -411,7 +412,8 @@ class NextFramePredictor(nn.Module):
                  use_flow: bool = True, flow_hidden_channels: int = 16,
                  use_blend_mask: bool = True, skip_lstm_base_channels: int = 16,
                  use_flow_acceleration: bool = True, st_memory_channels: int = 32,
-                 world_model_hidden_channels: int = 64):
+                 world_model_hidden_channels: int = 64,
+                 initial_weights: dict = None, uncertainty_clamp: float = 6.0):
         super().__init__()
         self.use_flow = use_flow
         self.use_flow_acceleration = use_flow_acceleration and use_flow
@@ -458,6 +460,10 @@ class NextFramePredictor(nn.Module):
         self.world_model_head = WorldModelHead(
             self.st_lstm.out_channels, self.encoder.out_channels, world_model_hidden_channels, kernel_size
         )
+        # Same rationale as world_model_head above: not called from
+        # forward(), invoked explicitly by training.py's loss wiring, rides
+        # in the same optimizer -- see UncertaintyWeighter.
+        self.loss_weighter = UncertaintyWeighter(initial_weights or {}, clamp=uncertainty_clamp)
 
     def encode_frame(self, frame):
         """Stateless, history-free encoder-only forward pass on a standalone
@@ -669,6 +675,39 @@ def world_model_consistency_loss(pred_latent: torch.Tensor, target_latent: torch
     pred_n = F.normalize(pred_latent, dim=1)
     target_n = F.normalize(target_latent, dim=1)
     return (1.0 - (pred_n * target_n).sum(dim=1)).mean()
+
+
+class UncertaintyWeighter(nn.Module):
+    """Learned homoscedastic uncertainty weighting (Kendall, Gal & Cipolla
+    2018) for the auxiliary loss terms composed in compute_training_loss.
+    Each term's static CLI weight becomes only its INITIAL value; from then
+    on `log_var_i` is a trained parameter, so `weight_i = exp(-log_var_i)`
+    adapts to that term's own loss scale instead of staying fixed -- at
+    equilibrium `weight_i ~= 1/loss_i`, so every term's weighted
+    contribution converges toward a comparable magnitude automatically.
+    Terms whose initial weight is 0 get no parameter at all, so setting a
+    CLI flag to 0 still fully disables that term, unchanged from before.
+    `log_var` is clamped since this project's single-frame (batch-size-1)
+    online updates make each term's gradient a noisy one-sample estimate,
+    and there's no checkpointing to recover from a runaway value."""
+
+    def __init__(self, initial_weights: dict, clamp: float = 6.0):
+        super().__init__()
+        self.clamp = clamp
+        self.log_vars = nn.ParameterDict({
+            name: nn.Parameter(torch.tensor(-math.log(w)))
+            for name, w in initial_weights.items() if w > 0
+        })
+
+    def _clamped(self, name):
+        return torch.clamp(self.log_vars[name], -self.clamp, self.clamp)
+
+    def weight(self, name):
+        return torch.exp(-self._clamped(name))
+
+    def weighted_term(self, name, loss):
+        log_var = self._clamped(name)
+        return torch.exp(-log_var) * loss + log_var
 
 
 class Discriminator(nn.Module):

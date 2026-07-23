@@ -9,9 +9,10 @@ webcam.py's old "background thread + lock-protected latest-frame" pattern to
 an arbitrary producer (the async WebSocket handler instead of cap.read()).
 """
 
+import math
 import threading
 import time
-from collections import deque
+from collections import defaultdict, deque
 
 import torch
 
@@ -97,12 +98,22 @@ def compute_rollout_loss(model, loss_fn, seed_pred, seed_hidden, targets, decay=
 
 def compute_training_loss(loss_fn, pred, target, prev_frame, flow, flow_velocity,
                            bottleneck_latent, world_model_target, world_model_head,
-                           discriminator, adv_weight_eff, rollout_loss, args):
+                           discriminator, adv_ramp_fraction, rollout_loss, loss_weighter, args):
     """Composes the swappable base photometric loss with the optional
     additive auxiliary terms (flow smoothness, flow-acceleration
     smoothness, motion-delta magnitude, world-model latent consistency,
     adversarial, rollout consistency), shared by both the delay=0 and
     buffered training branches.
+
+    Each auxiliary term's contribution is `loss_weighter.weighted_term(name, raw)`
+    -- learned homoscedastic uncertainty weighting (Kendall, Gal & Cipolla
+    2018), not a static CLI-weight multiply -- see model.py's
+    UncertaintyWeighter. A term is active iff `name in loss_weighter.log_vars`,
+    which is decided once at construction from that term's CLI flag (0
+    means "never construct a weight for this, it's fully disabled"); the
+    base photometric loss itself is deliberately NOT run through the
+    weighter and stays an unweighted anchor, so a runaway auxiliary weight
+    can never zero out the primary prediction objective.
 
     `bottleneck_latent`/`world_model_target` are one tick STALE relative to
     `pred`/`target` here -- both come from the SAME earlier forward call
@@ -113,30 +124,74 @@ def compute_training_loss(loss_fn, pred, target, prev_frame, flow, flow_velocity
     scalar (see compute_rollout_loss) with its own un-detached multi-step
     graph attached -- this backward() is what finally consumes it.
 
+    `adv_ramp_fraction` (0..1, see the warmup comment in
+    TrainingEngine._predict_and_learn) scales the WHOLE Kendall-weighted
+    adversarial term, including its log-variance regularizer, not just the
+    raw GAN loss -- scaling only the raw loss would make the log-variance's
+    gradient behave as if the observed loss were ~0 during warmup, which
+    drives that weight to its clamp ceiling immediately (the opposite of
+    what warmup is for). Ramping the whole term keeps the learned weight
+    near its CLI-derived initial value until the discriminator signal is
+    real.
+
     The adversarial term does NOT detach `pred`: gradient must flow from
     the discriminator's verdict back into the generator. Backpropagating
     through `discriminator`'s own forward graph as a side effect populates
     stray `.grad` on ITS parameters too -- harmless only because the
     discriminator's own optimizer step (in TrainingEngine._predict_and_learn)
-    unconditionally zero_grad()s before its own separate backward pass."""
+    unconditionally zero_grad()s before its own separate backward pass.
+
+    Returns `(loss, breakdown)`: `breakdown` is a `{term_name: weighted_value}`
+    dict with one entry per active term (regardless of whether it fired
+    this particular tick), so callers can log each term's actual share of
+    the total rather than only ever seeing the sum. The world-model/rollout
+    terms are horizon-gated by the replay buffer and report 0.0 on ticks
+    where they didn't have a target/chain to score against -- that's
+    meaningful (it shows how often the gate is open at the current delay
+    setting), not a bug."""
+    breakdown = {}
     weight_map = None
     if args.motion_loss_weight > 0:
         weight_map = motion_weight_map(target, prev_frame, args.motion_loss_weight)
     loss = loss_fn(pred, target, weight_map=weight_map)
-    if args.flow_smoothness_weight > 0 and flow is not None:
-        loss = loss + args.flow_smoothness_weight * flow_smoothness_loss(flow, prev_frame)
-    if args.flow_accel_smoothness_weight > 0 and flow_velocity is not None:
-        loss = loss + args.flow_accel_smoothness_weight * flow_smoothness_loss(flow_velocity, prev_frame)
-    if args.motion_delta_weight > 0:
-        loss = loss + args.motion_delta_weight * motion_delta_loss(pred, target, prev_frame)
-    if args.world_model_weight > 0 and world_model_target is not None:
-        pred_latent = world_model_head(bottleneck_latent, flow, flow_velocity)
-        loss = loss + args.world_model_weight * world_model_consistency_loss(pred_latent, world_model_target)
-    if adv_weight_eff > 0:
-        loss = loss + adv_weight_eff * lsgan_g_loss(discriminator(pred))
-    if args.rollout_weight > 0 and rollout_loss is not None:
-        loss = loss + args.rollout_weight * rollout_loss
-    return loss
+    breakdown["base"] = loss.item()
+    if "flow_smoothness" in loss_weighter.log_vars and flow is not None:
+        term = loss_weighter.weighted_term("flow_smoothness", flow_smoothness_loss(flow, prev_frame))
+        loss = loss + term
+        breakdown["flow_smoothness"] = term.item()
+    if "flow_accel_smoothness" in loss_weighter.log_vars and flow_velocity is not None:
+        term = loss_weighter.weighted_term(
+            "flow_accel_smoothness", flow_smoothness_loss(flow_velocity, prev_frame)
+        )
+        loss = loss + term
+        breakdown["flow_accel_smoothness"] = term.item()
+    if "motion_delta" in loss_weighter.log_vars:
+        term = loss_weighter.weighted_term("motion_delta", motion_delta_loss(pred, target, prev_frame))
+        loss = loss + term
+        breakdown["motion_delta"] = term.item()
+    if "world_model" in loss_weighter.log_vars:
+        if world_model_target is not None:
+            pred_latent = world_model_head(bottleneck_latent, flow, flow_velocity)
+            term = loss_weighter.weighted_term(
+                "world_model", world_model_consistency_loss(pred_latent, world_model_target)
+            )
+            loss = loss + term
+            breakdown["world_model"] = term.item()
+        else:
+            breakdown["world_model"] = 0.0
+    if "adversarial" in loss_weighter.log_vars:
+        raw = lsgan_g_loss(discriminator(pred))
+        term = adv_ramp_fraction * loss_weighter.weighted_term("adversarial", raw)
+        loss = loss + term
+        breakdown["adversarial"] = term.item()
+    if "rollout" in loss_weighter.log_vars:
+        if rollout_loss is not None:
+            term = loss_weighter.weighted_term("rollout", rollout_loss)
+            loss = loss + term
+            breakdown["rollout"] = term.item()
+        else:
+            breakdown["rollout"] = 0.0
+    return loss, breakdown
 
 
 class TrainingEngine:
@@ -149,6 +204,18 @@ class TrainingEngine:
         self.width = args.width
         self.height = args.height
 
+        # Static CLI weights for the auxiliary loss terms now only seed each
+        # term's INITIAL learned-uncertainty weight (see model.py's
+        # UncertaintyWeighter) -- omitting a term here (weight 0) still
+        # fully disables it, unchanged from the old static-weight behavior.
+        initial_weights = {
+            "flow_smoothness": args.flow_smoothness_weight,
+            "flow_accel_smoothness": args.flow_accel_smoothness_weight,
+            "motion_delta": args.motion_delta_weight,
+            "world_model": args.world_model_weight,
+            "adversarial": args.adv_weight,
+            "rollout": args.rollout_weight,
+        }
         self.model = NextFramePredictor(
             encoder_base_channels=args.encoder_base_channels,
             encoder_scales=args.encoder_scales,
@@ -164,6 +231,8 @@ class TrainingEngine:
             use_flow_acceleration=args.flow_acceleration == "on",
             st_memory_channels=args.st_memory_channels,
             world_model_hidden_channels=args.world_model_hidden_channels,
+            initial_weights=initial_weights,
+            uncertainty_clamp=args.uncertainty_clamp,
         ).to(device)
         self.optimizer, self.lr_scheduler = make_optimizer_and_scheduler(
             args.optimizer, self.model.parameters(), args.lr,
@@ -215,6 +284,18 @@ class TrainingEngine:
         # one-per-iteration so every real frame is eventually trained on.
         self._buffer = deque()
         self._loss_history = deque(maxlen=args.loss_window)
+        # Per-term rolling history (see compute_training_loss's `breakdown`
+        # return value), keyed lazily so only terms with a nonzero CLI
+        # weight ever show up -- lets the stats readout show each loss
+        # term's actual weighted contribution instead of only their sum.
+        self._loss_component_history = defaultdict(lambda: deque(maxlen=args.loss_window))
+        # Which auxiliary terms' learned weight (see model.py's
+        # UncertaintyWeighter) are currently pinned near --uncertainty-clamp
+        # -- tracked so _check_loss_weight_saturation only logs on
+        # transitions, not every tick. There's no checkpointing in this
+        # project, so this console warning is the only way to notice a term
+        # has run away during an unattended session.
+        self._saturated_loss_weights = set()
         self.frame_count = 0
         self.fps = 0.0
         self._last_tick = time.time()
@@ -267,6 +348,33 @@ class TrainingEngine:
         else:
             print(f"[krystalball] world-model loss inactive: real-frame delay ({target_lag}) "
                   f"< --world-model-horizon ({self.args.world_model_horizon})")
+
+    def _check_loss_weight_saturation(self, loss_weights):
+        """Warn (on transitions only) when a learned auxiliary-loss weight
+        (see model.py's UncertaintyWeighter) is pinned near either
+        --uncertainty-clamp bound -- with no checkpointing/history beyond
+        the live console in this project, this is the only way to notice a
+        term has run away during an unattended session."""
+        clamp = self.args.uncertainty_clamp
+        lo, hi = math.exp(-clamp), math.exp(clamp)
+        # 90% of the way to either clamp bound, in log-var space (where the
+        # clamp is actually applied) -- NOT 90% of the weight range, which
+        # would be a very different (and wrong) threshold on this log scale.
+        lo_thresh, hi_thresh = math.exp(-0.9 * clamp), math.exp(0.9 * clamp)
+        currently_saturated = set()
+        for name, weight in loss_weights.items():
+            if weight <= lo_thresh or weight >= hi_thresh:
+                currently_saturated.add(name)
+        newly = currently_saturated - self._saturated_loss_weights
+        cleared = self._saturated_loss_weights - currently_saturated
+        for name in newly:
+            print(f"[krystalball] WARNING: learned weight for '{name}' loss term saturated near "
+                  f"--uncertainty-clamp bound (weight={loss_weights[name]:.4g}, range "
+                  f"[{lo:.4g}, {hi:.4g}]) -- consider raising --uncertainty-clamp or revisiting "
+                  f"that term's --*-weight init")
+        for name in cleared:
+            print(f"[krystalball] learned weight for '{name}' loss term back within normal range")
+        self._saturated_loss_weights = currently_saturated
 
     def start(self):
         self._thread.start()
@@ -330,6 +438,7 @@ class TrainingEngine:
         )
         self._adv_step_count = 0
         self._loss_history.clear()
+        self._loss_component_history.clear()
 
     def _predict_and_learn(self, ground_truth, world_model_horizon=None, rollout_horizon=None):
         """One predict-then-learn step against a genuine ground-truth frame
@@ -359,24 +468,25 @@ class TrainingEngine:
         the primary loop's own next-step term). Stashed the same one-tick-
         stale way as the world-model target above."""
         if self.train_pred is not None:
-            # Adversarial-weight warmup, mirroring the LR-warmup pattern but
-            # as a manually tracked ramp (it scales a loss weight, not an
-            # LR, so LinearLR doesn't directly apply): ramps 0 -> adv_weight
-            # over adv_warmup_steps steps, restarted on reset. Mitigates the
-            # classic GAN cold-start problem -- an untrained predictor's
-            # early noisy output would otherwise give the discriminator a
-            # trivial win with near-zero useful gradient back to the
-            # generator.
+            # Adversarial ramp fraction (0..1), mirroring the LR-warmup
+            # pattern but as a manually tracked ramp (it scales a loss
+            # weight, not an LR, so LinearLR doesn't directly apply): ramps
+            # 0 -> 1 over adv_warmup_steps steps, restarted on reset.
+            # Mitigates the classic GAN cold-start problem -- an untrained
+            # predictor's early noisy output would otherwise give the
+            # discriminator a trivial win with near-zero useful gradient
+            # back to the generator. Scales the WHOLE learned-weight
+            # adversarial term (see compute_training_loss's docstring), not
+            # a fixed --adv-weight, since that's now only the term's
+            # initial value under learned uncertainty weighting.
             self._adv_step_count += 1
-            adv_weight_eff = self.args.adv_weight * min(
-                1.0, self._adv_step_count / max(1, self.args.adv_warmup_steps)
-            )
-            loss = compute_training_loss(
+            adv_ramp_fraction = min(1.0, self._adv_step_count / max(1, self.args.adv_warmup_steps))
+            loss, loss_breakdown = compute_training_loss(
                 self.loss_fn, self.train_pred, ground_truth,
                 self.prev_train_frame, self.train_flow, self.train_flow_velocity,
                 self.pending_bottleneck_latent, self.pending_world_model_target,
-                self.model.world_model_head, self.discriminator, adv_weight_eff,
-                self.pending_rollout_loss, self.args,
+                self.model.world_model_head, self.discriminator, adv_ramp_fraction,
+                self.pending_rollout_loss, self.model.loss_weighter, self.args,
             )
             self.optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -386,6 +496,8 @@ class TrainingEngine:
             if self.lr_scheduler is not None:
                 self.lr_scheduler.step()
             self._loss_history.append(loss.item())
+            for term_name, term_value in loss_breakdown.items():
+                self._loss_component_history[term_name].append(term_value)
             # Cut the graph so next timestep's backward can't walk
             # back through this one -- backprop spans exactly one step.
             self.train_hidden = detach_hidden(self.train_hidden)
@@ -503,7 +615,25 @@ class TrainingEngine:
                 inst_fps = 1.0 / dt
                 self.fps = inst_fps if self.frame_count == 1 else 0.9 * self.fps + 0.1 * inst_fps
             avg_loss = sum(self._loss_history) / len(self._loss_history) if self._loss_history else 0.0
+            # Rolling per-term average of each enabled auxiliary loss's
+            # WEIGHTED contribution (see compute_training_loss's `breakdown`)
+            # -- lets the stats readout show which term is actually driving
+            # `avg_loss` instead of only the summed total.
+            loss_breakdown_avg = {
+                term_name: sum(history) / len(history)
+                for term_name, history in self._loss_component_history.items()
+                if history
+            }
             mode_label = "REAL" if is_anchor_step else "FREE-RUN"
+
+            # Current (not rolling-averaged -- these drift slowly relative
+            # to the per-step loss) learned weight for each active
+            # auxiliary term, see model.py's UncertaintyWeighter.
+            loss_weights = {
+                name: self.model.loss_weighter.weight(name).item()
+                for name in self.model.loss_weighter.log_vars
+            }
+            self._check_loss_weight_saturation(loss_weights)
 
             pred_jpeg = frame_codec.tensor_to_jpeg(pred_for_display)
             stats = {
@@ -511,6 +641,8 @@ class TrainingEngine:
                 "frame_count": self.frame_count,
                 "fps": round(self.fps, 1),
                 "avg_loss": avg_loss,
+                "loss_breakdown": loss_breakdown_avg,
+                "loss_weights": loss_weights,
                 "mode_label": mode_label,
                 "buffer_len": len(self._buffer),
                 "target_lag": target_lag,
