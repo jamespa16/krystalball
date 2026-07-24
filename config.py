@@ -197,6 +197,28 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "at the cost of reacting more slowly to fast real motion.",
     )
     p.add_argument(
+        "--attn-heads",
+        type=int,
+        default=4,
+        help="Number of heads in a global self-attention block applied to the ST-LSTM "
+        "core's bottleneck output before the decoder (default: 4). Every conv in this "
+        "model (encoder/decoder, ST-LSTM gates, FlowHead) only ever sees a local "
+        "receptive field per step; this gives every bottleneck position direct access "
+        "to every other position in the same frame -- e.g. for whole-frame lighting "
+        "shifts or fast/large motion no single conv kernel's receptive field can span. "
+        "Zero-initialized so a fresh model starts identical to no attention at all (see "
+        "BottleneckAttentionStack). Must evenly divide --lstm-hidden-channels. Set to 0 "
+        "to disable the block entirely.",
+    )
+    p.add_argument(
+        "--attn-layers",
+        type=int,
+        default=1,
+        help="Number of stacked bottleneck self-attention blocks (default: 1). Ignored "
+        "when --attn-heads is 0. Increase for more global-context capacity at extra "
+        "per-frame compute cost.",
+    )
+    p.add_argument(
         "--use-flow",
         choices=["on", "off"],
         default="on",

@@ -276,6 +276,10 @@ class TrainingEngine:
             superres_channels=args.superres_channels,
             superres_blocks=args.superres_blocks,
             superres_delta_scale=args.superres_delta_scale,
+            attn_heads=args.attn_heads,
+            attn_layers=args.attn_layers,
+            height=args.height,
+            width=args.width,
         ).to(self.device)
 
     def _build_discriminator(self):

@@ -431,6 +431,81 @@ class SuperResHead(nn.Module):
         return (base + delta).clamp(0.0, 1.0)
 
 
+class BottleneckAttentionBlock(nn.Module):
+    """Global self-attention refinement of the ST-LSTM core's bottleneck
+    output. Every conv (encoder/decoder, ST-LSTM gates, FlowHead) only ever
+    sees a local receptive field per step; this lets every spatial position
+    attend directly to every other position in the same frame -- e.g. for
+    whole-frame lighting shifts or fast/large motion no single conv kernel's
+    receptive field can span. Pre-norm via the shared GroupNorm helper (not
+    BatchNorm/LayerNorm) to match this file's batch-size-1 house style, and
+    a conv-space FFN (1x1 convs + ReLU, not nn.Linear/GELU) for the same
+    reason. Both the attention output projection and the FFN's second conv
+    are zero-initialized, so the block is an exact identity function at
+    construction -- the same "zero-init residual on a sane base" convention
+    as Decoder.final_up/FlowHead/SuperResHead. Zero-init only guarantees
+    identity at construction, not afterward -- attn_gate/ffn_gate are a
+    persistent, independently-clamped-to-[0,1] scalar throttle per branch
+    (same convention as Decoder.mask_gate) so the optimizer can rein a
+    misbehaving branch back toward inert without having to unwind
+    out_proj/ffn2's own weights."""
+
+    def __init__(self, channels: int, num_heads: int):
+        super().__init__()
+        self.norm1 = _group_norm(channels)
+        self.attn = nn.MultiheadAttention(channels, num_heads, batch_first=True)
+        nn.init.zeros_(self.attn.out_proj.weight)
+        nn.init.zeros_(self.attn.out_proj.bias)
+        self.attn_gate = nn.Parameter(torch.zeros(1))
+        self.norm2 = _group_norm(channels)
+        self.ffn1 = nn.Conv2d(channels, channels, 1)
+        self.ffn2 = nn.Conv2d(channels, channels, 1)
+        nn.init.zeros_(self.ffn2.weight)
+        nn.init.zeros_(self.ffn2.bias)
+        self.ffn_gate = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x):
+        b, c, h, w = x.shape
+        tokens = self.norm1(x).flatten(2).transpose(1, 2)
+        attn_out, _ = self.attn(tokens, tokens, tokens, need_weights=False)
+        attn_gate = torch.clamp(self.attn_gate, 0.0, 1.0)
+        x = x + attn_gate * attn_out.transpose(1, 2).reshape(b, c, h, w)
+        ffn_gate = torch.clamp(self.ffn_gate, 0.0, 1.0)
+        x = x + ffn_gate * self.ffn2(F.relu(self.ffn1(self.norm2(x))))
+        return x
+
+
+class BottleneckAttentionStack(nn.Module):
+    """Stack of BottleneckAttentionBlocks plus one shared learned positional
+    embedding -- unlike convs, attention is permutation-invariant over
+    spatial positions, so position has to be reintroduced explicitly. The
+    embedding is zero-initialized like everything else in the stack, so the
+    whole stack (any number of layers) is a no-op at construction. Global
+    softmax attention has no locality bias, so once training moves blocks
+    off identity, out_norm renormalizes the stack's cumulative *delta*
+    (never the raw output -- that would rescale the real input even at
+    construction, since GroupNorm(x0) != x0 in general) before it's added
+    back, bounding the aggregate contribution that reaches the decoder's
+    color-producing layers."""
+
+    def __init__(self, channels: int, num_heads: int, num_layers: int, num_positions: int):
+        super().__init__()
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_positions, channels))
+        self.blocks = nn.ModuleList(
+            [BottleneckAttentionBlock(channels, num_heads) for _ in range(num_layers)]
+        )
+        self.out_norm = _group_norm(channels)
+
+    def forward(self, x):
+        b, c, h, w = x.shape
+        x0 = x
+        x = x + self.pos_embed.transpose(1, 2).reshape(1, c, h, w)
+        for block in self.blocks:
+            x = block(x)
+        delta = x - x0
+        return x0 + self.out_norm(delta)
+
+
 class NextFramePredictor(nn.Module):
     """(flow-warp) -> encoder -> HierarchicalSTLSTM (spanning both skip
     scales and bottleneck depth) -> decoder. Carries recurrent state
@@ -452,7 +527,8 @@ class NextFramePredictor(nn.Module):
                  use_flow_acceleration: bool = True, st_memory_channels: int = 32,
                  initial_weights: dict = None, uncertainty_clamp: float = 6.0,
                  upscale: int = 1, superres_channels: int = 32, superres_blocks: int = 2,
-                 superres_delta_scale: float = 0.5):
+                 superres_delta_scale: float = 0.5, attn_heads: int = 4, attn_layers: int = 1,
+                 height: int = None, width: int = None):
         super().__init__()
         self.upscale = upscale
         if superres_channels > 0 and upscale > 1:
@@ -500,6 +576,17 @@ class NextFramePredictor(nn.Module):
             hidden_channels_list = bottleneck_hidden_channels
             decoder_skip_channels = self.encoder.skip_channels
         self.st_lstm = HierarchicalSTLSTM(in_channels_list, hidden_channels_list, st_memory_channels, kernel_size)
+        if attn_heads > 0 and attn_layers > 0:
+            bh, bw = height // (2 ** encoder_scales), width // (2 ** encoder_scales)
+            self.bottleneck_attn = BottleneckAttentionStack(
+                lstm_hidden_channels, attn_heads, attn_layers, bh * bw
+            )
+        else:
+            # --attn-heads 0 (or --attn-layers 0) disables the block
+            # entirely -- forward() skips it outright, no fallback needed
+            # since "no global attention" is a legitimate terminal state,
+            # unlike SuperResHead's bilinear fallback.
+            self.bottleneck_attn = None
         self.decoder = Decoder(
             self.st_lstm.out_channels, decoder_skip_channels, encoder_base_channels,
             in_channels, delta_scale, res_blocks_per_scale, use_blend_mask
@@ -597,6 +684,9 @@ class NextFramePredictor(nn.Module):
         else:
             outs, st_hidden = self.st_lstm([features], hidden.st_lstm)
             skip_outs, bottleneck_latent = skips, outs[-1]
+
+        if self.bottleneck_attn is not None:
+            bottleneck_latent = self.bottleneck_attn(bottleneck_latent)
 
         if self.use_flow and prev_frame is not None:
             # Skip features were captured from the current (unwarped) frame,

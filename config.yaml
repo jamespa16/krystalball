@@ -45,6 +45,8 @@ model_architecture:
   st_memory_channels: 32
   skip_lstm_base_channels: 16
   delta_scale: 0.6
+  attn_heads: 4
+  attn_layers: 1
 
 flow_and_motion:
   use_flow: "on"
